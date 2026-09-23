@@ -45,7 +45,7 @@ t_the_reported_version_is_that_version() {
     # the same string, not merely a parallel constant that happens to match.
     run_tx --version
     assert_status 0 "$RUN_RC"
-    assert_contains "$RUN_OUT" "tx $(pyproject_version)"
+    assert_contains "$RUN_OUT" "testing-orchestrator $(pyproject_version)"
 }
 
 echo "version"

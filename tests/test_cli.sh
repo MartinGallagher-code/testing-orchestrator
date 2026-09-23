@@ -21,15 +21,15 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_helper.bash"
 t_version_leads_with_a_line_a_script_can_parse() {
     run_tx --version
     assert_status 0 "$RUN_RC"
-    assert_eq "tx" "$(printf '%s' "$RUN_OUT" | head -1 | cut -d' ' -f1)"
+    assert_eq "testing-orchestrator" "$(printf '%s' "$RUN_OUT" | head -1 | cut -d' ' -f1)"
     assert_contains "$RUN_OUT" "GPL-3.0-or-later"
 }
 
 t_no_arguments_points_somewhere_useful() {
     run_tx
     assert_status 2 "$RUN_RC"
-    assert_contains "$RUN_OUT" "start here"
-    assert_contains "$RUN_OUT" "tx hints"
+    assert_contains "$RUN_OUT" "testing-orchestrator run"
+    assert_contains "$RUN_OUT" "testing-orchestrator hints"
 }
 
 t_hints_maps_goals_to_commands() {
@@ -47,7 +47,8 @@ t_help_lists_every_command_and_its_switches() {
     assert_status 0 "$RUN_RC"
     for verb in gen check doctor start status collect summarize stop logs \
                 clean run hints; do
-        assert_contains "$RUN_OUT" "tx $verb" "help should cover $verb"
+        assert_contains "$RUN_OUT" "testing-orchestrator $verb" \
+            "help should cover $verb"
     done
     # And the environment a job runs under is part of the interface.
     assert_contains "$RUN_OUT" "TX_OUT"

@@ -13,6 +13,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Shorter help.** `--help` no longer prints the whole README: it gives the
+  quick-start commands and the list of commands. Each option's help now fits on
+  one line. `tx help` lists the shared fleet options once, then each command's
+  own options, one line each.
+- **The help and `--version` use the package name, `testing-orchestrator`.**
+  `tx` is still installed as its short name, and the usage lines show `tx`
+  when you run it as `tx`.
+
 - **Licensing and attribution are now identical across every repository in
   the suite.** The notice said the same thing eleven slightly different ways —
   different badge text, different `--version` wording, five styles of file

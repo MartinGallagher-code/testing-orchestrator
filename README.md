@@ -63,7 +63,7 @@ removes itself.
 pip install testing-orchestrator
 ```
 
-That puts `tx` on your `PATH` (and `testing-orchestrator` as an alias). No
+That puts `testing-orchestrator` on your `PATH`, and `tx` as its short name. No
 dependencies — the package is standard-library only.
 
 Or skip installing entirely: `tx` is one self-contained file.
