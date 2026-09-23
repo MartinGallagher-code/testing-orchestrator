@@ -3053,6 +3053,24 @@ def _wrap(prefix, text, width=76):
 # CLI
 # ---------------------------------------------------------------------------
 
+USAGE = """\
+testing-orchestrator (short name: tx) runs one job on every host at the
+same instant and collects the results.
+
+  %(prog)s gen --servers servers.txt --payload ./bench --run ./bench.sh
+  %(prog)s run          # start, wait, summarize, collect
+
+Options for one command:  %(prog)s CMD --help
+Options for every command:  %(prog)s help
+Goal-to-command examples:  %(prog)s hints"""
+
+
+def _prog():
+    """The name to show in help: `tx` when that is what was typed, the
+    package's own name otherwise."""
+    name = os.path.basename(sys.argv[0] or "")
+    return "tx" if name == "tx" else "testing-orchestrator"
+
 def _add_fleet_flags(p):
     p.add_argument("--plan", default=_env("TX_PLAN", DEFAULT_PLAN),
                    help="plan file (default: %(default)s)")
@@ -3060,10 +3078,12 @@ def _add_fleet_flags(p):
                    help="ssh user (default: your ssh config)")
     p.add_argument("--jobs", type=int,
                    default=int(_env("TX_JOBS", str(DEFAULT_JOBS))),
+                   metavar="N",
                    help="ssh fan-out concurrency (default: %(default)s)")
     p.add_argument("--remote-dir", default=_env("TX_REMOTE_DIR", ""),
-                   help="working directory on each host (default: the "
-                        "plan's remote_dir)")
+                   metavar="DIR",
+                   help="working directory on each host (default: from "
+                        "the plan)")
     p.add_argument("--python", default=_env("TX_PYTHON", "python3"),
                    help="python on the hosts (default: %(default)s)")
     p.add_argument("--ssh", default=_env("TX_SSH", "ssh"),
@@ -3077,36 +3097,30 @@ def _add_fleet_flags(p):
 def _add_start_flags(p):
     p.add_argument("--start-in", type=float, default=DEFAULT_START_IN,
                    metavar="S",
-                   help="seconds to arm the synchronised start ahead of now; "
-                        "it has to outlast the ssh fan-out (default: "
-                        "%(default)s, and it grows with the fleet)")
+                   help="arm the start this many seconds ahead (default: "
+                        "%(default)s, more for big fleets)")
     p.add_argument("--max-skew", type=float, default=DEFAULT_MAX_SKEW,
                    metavar="S",
-                   help="refuse to start if any host's clock is further than "
-                        "this from ours (default: %(default)s)")
+                   help="max clock difference allowed (default: "
+                        "%(default)s)")
     p.add_argument("--no-skew-check", action="store_true",
                    help="start without asking the fleet what time it is")
     p.add_argument("--no-deploy", action="store_true",
-                   help="do not copy the agent or the payload, just start "
-                        "what is already there")
+                   help="start what is already on the hosts, copy nothing")
     p.add_argument("--peers", action="store_true",
                    help="put the whole host list in $TX_HOSTS for the job")
 
 
 def _add_collect_flags(p):
     p.add_argument("-d", "--dir", default=_env("TX_DIR", ""), metavar="DIR",
-                   help="where collected files land (default: a "
-                        "tx-<timestamp> of this collection's own; with "
-                        "--batch, one directory for the whole sweep)")
+                   help="where results land (default: tx-<timestamp>)")
     p.add_argument("--timeout", type=float, default=900.0, metavar="S",
                    help="per-host limit on the transfer (default: "
                         "%(default)s)")
     p.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
                    metavar="N",
-                   help="refuse to bring back a file larger than this, and "
-                        "name it instead (default: %d, 0 for no ceiling). "
-                        "Applied on the host, so an oversized file never "
-                        "crosses the network" % DEFAULT_MAX_BYTES)
+                   help="skip files larger than N bytes (default: %d, "
+                        "0 = no limit)" % DEFAULT_MAX_BYTES)
     p.add_argument("--csv", metavar="PATH", nargs="?", const="-",
                    help="also write one row per collected file")
     p.add_argument("--quiet", action="store_true",
@@ -3114,11 +3128,13 @@ def _add_collect_flags(p):
 
 
 def build_parser():
+    prog = _prog()
     ap = argparse.ArgumentParser(
-        prog="tx", description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        prog=prog, description=USAGE % {"prog": prog},
+        formatter_class=lambda prog: argparse.RawDescriptionHelpFormatter(
+            prog, max_help_position=30))
     ap.add_argument("--version", action="version",
-                    version="tx %s\n"
+                    version="testing-orchestrator %s\n"
                             "Copyright (C) 2026 Martin J. Gallagher\n"
                             "License: GPL-3.0-or-later "
                             "<https://www.gnu.org/licenses/gpl-3.0.html>\n"
@@ -3126,7 +3142,7 @@ def build_parser():
                             "and redistribute it.\n"
                             "There is no warranty, to the extent permitted "
                             "by law." % VERSION)
-    sub = ap.add_subparsers(dest="cmd")
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
 
     g = sub.add_parser("gen", help="build plan.ini from a server list")
     g.add_argument("--servers", default=_env("TX_SERVERS", DEFAULT_SERVERS),
@@ -3142,23 +3158,20 @@ def build_parser():
     g.add_argument("--teardown", metavar="CMD",
                    help="run on each host after the job, pass or fail")
     g.add_argument("--payload", metavar="PATH",
-                   help="a file or directory shipped to every host and "
-                        "unpacked into the working directory")
+                   help="file or directory to ship to every host")
     g.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                    metavar="S",
                    help="seconds before a host's job is killed (default: "
                         "%(default)s)")
     g.add_argument("--stdin", metavar="NAME",
-                   help="a file in the working directory to feed the job on "
-                        "stdin; ship it in the payload")
+                   help="file (in the payload) to feed the job on stdin")
     g.add_argument("--collect", action="append", metavar="GLOB",
-                   help="extra things to collect, repeatable; out/ and the "
-                        "run record always come back")
+                   help="extra files to collect, repeatable")
     g.add_argument("--tag", metavar="NAME",
-                   help="leads every collected filename (default: the "
-                        "command's first word)")
+                   help="prefix for collected filenames")
     g.add_argument("--remote-dir", default=_env("TX_REMOTE_DIR",
                                                 DEFAULT_REMOTE_DIR),
+                   metavar="DIR",
                    help="working directory on each host (default: "
                         "%(default)s)")
 
@@ -3212,83 +3225,50 @@ def build_parser():
     r.add_argument("--clean", action="store_true",
                    help="also remove every trace once the results are back")
     r.add_argument("-b", "--batch", type=int, default=None, metavar="N",
-                   help="cover the fleet N hosts at a time instead of all "
-                        "at once: each wave is armed for its own instant, "
-                        "waited for and collected, then the next wave "
-                        "starts, until the fleet is used up. Everything "
-                        "lands in one directory. This is not --jobs, which "
-                        "is only how many ssh connections are open at once")
+                   help="run N hosts at a time, in waves")
     r.add_argument("--resume", action="store_true",
                    help="with --batch, skip hosts that already have a "
-                        "result and cover only what is left. The fleet "
-                        "itself is the record, so a sweep survives its "
-                        "own orchestrator being killed")
+                        "result")
     r.add_argument("--muster", nargs="?",
                    const=_env("MUSTER_POOL", "muster.csv"), default=None,
                    metavar="POOL",
-                   help="draw the work from a binnacle muster pool instead "
-                        "of the plan's whole host list: take --batch items "
-                        "under a lease, run them as one wave, check them "
-                        "back in (done if they ran, released if nothing "
-                        "reached them), and ask for more until the pool has "
-                        "none left. The plan stays the address book; the "
-                        "pool decides which items and in what order. "
-                        "Defaults to muster.csv (or $MUSTER_POOL)")
+                   help="take hosts from a muster pool, --batch at a time "
+                        "(default: muster.csv)")
     r.add_argument("--muster-cmd", default=_env("TX_MUSTER", ""),
                    metavar="CMD",
-                   help="how to invoke muster (default: `muster` on PATH). "
-                        "Use e.g. 'python3 -m binnacle.muster' when it is "
-                        "not installed as a script")
+                   help="how to invoke muster (default: muster)")
     r.add_argument("--lease", default="", metavar="DUR",
-                   help="with --muster, how long each wave holds its items "
-                        "for -- 30m, 2h, 90 (seconds). The default is twice "
-                        "the wave's own time bound, so a lease outlasts the "
-                        "work it covers; too short and an item goes back to "
-                        "the pool while tx is still running it")
+                   help="with --muster, lease length, e.g. 30m, 2h, 90")
     r.add_argument("--poll", type=float, default=None, metavar="S",
-                   help="seconds between status checks while waiting "
-                        "(default: from 2s, growing to 30s the longer the "
-                        "wait). Every check is an ssh per host, landing on "
-                        "the machines under measurement, so rarely is "
-                        "usually better")
+                   help="seconds between status checks (default: 2 "
+                        "backing off to 30)")
     r.add_argument("--stop-on-fail", action="store_true",
-                   help="with --batch, stop after a wave that did not start "
-                        "or did not finish, instead of carrying on")
+                   help="with --batch, stop after a failed wave")
 
     ex = sub.add_parser("export",
-                        help="the run as overlay samples for the datacenter "
-                             "layout viewer")
+                        help="write results for the layout viewer")
     _add_fleet_flags(ex)
     ex.add_argument("--from", dest="from_dir", metavar="DIR",
-                    help="read the run.json records a `tx collect` directory "
-                         "already holds, instead of asking the fleet -- no "
-                         "ssh, and it works after `tx clean`")
-    ex.add_argument("--output", "-o", default="-",
+                    help="read a collected directory instead of the fleet")
+    ex.add_argument("-o", "--output", default="-", metavar="FILE",
                     help="results file to write ('-' for stdout, the default)")
     ex.add_argument("--append", action="store_true",
-                    help="append to --output instead of replacing it: results "
-                         "files are append-only, so a run per append is a "
-                         "history the viewer can aggregate over")
+                    help="append to --output instead of replacing it")
     ex.add_argument("--json", action="store_true",
-                    help="write NDJSON (one sample object per line) instead "
-                         "of the tab-separated form")
+                    help="write NDJSON instead of TSV")
     ex.add_argument("--names", metavar="FILE",
-                    help="map tx host names to the names the layout uses: "
-                         "one `txname target` per line")
+                    help="host name map, one `txname target` per line")
     ex.add_argument("--target-prefix", default="", metavar="STR",
-                    help="string prepended to every target, e.g. 'DH1/A/' "
-                         "when the layout addresses nodes by path")
+                    help="prefix for every target, e.g. 'DH1/A/'")
     ex.add_argument("--test-prefix", default="tx_", metavar="STR",
-                    help="string prepended to every test name, so tx overlays "
-                         "cannot collide with another tool's in the same "
-                         "results file (default: %(default)s)")
+                    help="prefix for every test name (default: %(default)s)")
     ex.add_argument("--run", metavar="LABEL",
                     help="tag every sample with run=LABEL")
     ex.add_argument("--no-meta", action="store_true",
                     help="do not write the !test metadata lines")
 
     sub.add_parser("hints", help="a goal, and the command that gets it")
-    sub.add_parser("help", help="every switch of every command, one page")
+    sub.add_parser("help", help="every command and its options")
 
     a = sub.add_parser("agent", help=argparse.SUPPRESS)
     a.add_argument("--host", required=True)
@@ -3304,40 +3284,53 @@ def build_parser():
     a.add_argument("--teardown", default="")
     a.add_argument("--stdin", default="")
     a.add_argument("--peers", default="")
+    # Internal: what `tx start` runs on each host, not for people.
+    sub._choices_actions = [c for c in sub._choices_actions
+                            if c.dest != "agent"]
     return ap
 
 
 def cmd_full_help(ap):
-    """`tx help`: the complete flag reference, generated from the real
-    parsers so it cannot drift from what the code accepts."""
+    """`tx help`: every command and its options, one line each, generated
+    from the real parsers so it cannot drift from what the code accepts."""
     sub_action = next(a for a in ap._actions
                       if isinstance(a, argparse._SubParsersAction))
-    log("tx %s -- every command, every switch. `tx CMD --help` shows one"
-        % VERSION)
-    log("command with its defaults; `tx hints` maps goals to commands.")
+    helps = {c.dest: c.help for c in sub_action._choices_actions}
+    common = argparse.ArgumentParser(add_help=False)
+    _add_fleet_flags(common)
+    shared = set(o for a in common._actions for o in a.option_strings)
+
+    def rows(actions):
+        for a in actions:
+            if a.help == argparse.SUPPRESS or "-h" in a.option_strings:
+                continue
+            name = ", ".join(a.option_strings)
+            if a.nargs != 0:
+                name += " " + (a.metavar or a.dest.upper())
+            yield "    %-22s %s" % (name, (a.help or "") % vars(a))
+
+    log("usage: %s COMMAND [options]" % ap.prog)
+    log("")
+    log("fleet options, taken by every command that talks to the hosts:")
+    for line in rows(common._actions):
+        log(line)
     for name, parser in sub_action.choices.items():
-        if name == "help":
+        if name not in helps or name == "help":
             continue
         log("")
-        log("=" * 74)
-        for line in parser.format_help().rstrip().splitlines():
-            if line.strip() == "options:":
-                continue
+        log("%s %-10s %s" % (ap.prog, name, helps[name]))
+        own = [a for a in parser._actions
+               if not shared.intersection(a.option_strings)
+               or name in ("gen", "check")]
+        for line in rows(own):
             log(line)
     log("")
-    log("=" * 74)
-    log("the job's environment on each host:")
-    log("  TX_HOST   this host's name in the plan")
-    log("  TX_OUT    where results should be written (collected in full)")
-    log("  TX_TAG    the run's tag, which leads every collected filename")
-    log("  TX_RUN_ID the run's stamp, shared by every host in one start")
-    log("  TX_INDEX / TX_NHOSTS   this host's position in the fleet")
-    log("  TX_HOSTS  the whole host list, with --peers")
-    log("")
-    log("environment variables (each is the default for the matching flag):")
-    log("  TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER (or SSH_USER)")
-    log("  TX_JOBS TX_PYTHON TX_MUSTER (how to invoke muster)")
-    log("  MUSTER_POOL   the default pool for --muster, shared with muster")
+    log("the job runs with: TX_HOST TX_OUT TX_TAG TX_RUN_ID TX_INDEX "
+        "TX_NHOSTS")
+    log("                   TX_HOSTS (with --peers)")
+    log("flag defaults from: TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER "
+        "TX_JOBS")
+    log("                    TX_PYTHON TX_MUSTER MUSTER_POOL")
     return 0
 
 
@@ -3355,10 +3348,6 @@ def main(argv=None):
     args = ap.parse_args(argv)
     if not args.cmd:
         ap.print_help()
-        log("")
-        log("start here:  tx gen --servers servers.txt --payload ./bench "
-            "--run ./bench.sh && tx run")
-        log("stuck?       tx hints        every switch:  tx help")
         return 2
     if args.cmd == "help":
         return cmd_full_help(ap)
