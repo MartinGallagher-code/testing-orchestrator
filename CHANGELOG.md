@@ -203,6 +203,11 @@ here on every change moves the version.
 
 ### Fixed
 
+- **CI's Python 3.9 job installs Python 3.9 again.** `ubuntu-latest` became
+  Ubuntu 26.04, for which `setup-python` has no 3.9 build, so the job failed
+  before running a test. 3.9 now runs on `ubuntu-24.04`; the other versions
+  stay on `ubuntu-latest`.
+
 - **`tx clean` claimed a clean fleet it had not checked.** It removes
   the working directory and then asks `pgrep` whether any agent outlived
   it -- but on a host without procps a missing `pgrep` returns 127,
