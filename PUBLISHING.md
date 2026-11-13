@@ -34,11 +34,16 @@ with `invalid-publisher`.
 The workflow name and environment must match exactly. A mismatch is the
 usual cause of `invalid-publisher`.
 
-## Cutting a release
+## Every change moves the version
 
-1. Update the version in **all three** places. They must agree — the test
-   suite (`tests/test_version.sh`) fails if they do not, and so does the
-   publish workflow if the tag disagrees:
+Every pull request into `main` raises the version, however small the change:
+code, tests, docs or CI. That is the owner's rule for every repository in the
+suite (shared_tools BN-002). Nothing waits for a release to be numbered, so in
+the same pull request:
+
+1. Raise the version in **all three** places. They must agree:
+   `tests/check_version.sh` and the test suite (`tests/test_version.sh`) fail
+   if they do not, and so does the publish workflow if the tag disagrees:
    - `pyproject.toml` → `version`
    - `testing_orchestrator/__init__.py` → `VERSION`
    - `testing_orchestrator/tx.py` → `VERSION`
@@ -51,22 +56,37 @@ usual cause of `invalid-publisher`.
    about what it ran, not a release that was cut carelessly.
 
    ```bash
-   sed -i 's/^VERSION = "1\.0\.0"$/VERSION = "1.1.0"/' \
+   sed -i 's/^VERSION = "1\.1\.0"$/VERSION = "1.2.0"/' \
        testing_orchestrator/__init__.py testing_orchestrator/tx.py
-   sed -i 's/^version = "1\.0\.0"$/version = "1.1.0"/' pyproject.toml
+   sed -i 's/^version = "1\.1\.0"$/version = "1.2.0"/' pyproject.toml
    ```
 
-2. Move the `## [Unreleased]` items in `CHANGELOG.md` under a new
-   `## [x.y.z] - YYYY-MM-DD` heading.
-3. Commit, and let CI go green on `main`.
-4. Tag and push:
+2. Open `CHANGELOG.md` with that version's own section,
+   `## [x.y.z] - YYYY-MM-DD`, saying what changed. Never an "Unreleased"
+   heading left for later.
+
+`bash tests/check_version.sh origin/main` checks both before you push. CI's
+`version` job runs the same check, and fails a pull request whose version is
+not greater than its base branch's, or whose changelog does not open with it.
+If `main` moves while a pull request is open, rebase and bump again. Which
+part to raise is under *Version numbers* below.
+
+## Cutting a release
+
+Publishing is a separate step, and a person's call. A version that is never
+published is fine; a change with no version is not. `main` already carries
+the version and its changelog section, so a release is only:
+
+1. Let CI go green on `main`.
+2. Tag and push the version `main` has:
 
    ```bash
-   git tag -a v1.1.0 -m "testing-orchestrator 1.1.0"
-   git push origin v1.1.0
+   v=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)
+   git tag -a "v$v" -m "testing-orchestrator $v"
+   git push origin "v$v"
    ```
 
-5. Publish a GitHub Release for that tag. That triggers `publish.yml`, which
+3. Publish a GitHub Release for that tag. That triggers `publish.yml`, which
    builds an sdist and a wheel, checks the metadata with `twine`, installs
    the wheel and smoke-tests both console scripts (`tx`, `testing-orchestrator`)
    before uploading.
@@ -107,7 +127,7 @@ every one skipped, the version was not bumped.
 
 [Semantic versioning](https://semver.org). For this project specifically:
 
-- **patch** — a bug fix
+- **patch** — a bug fix, or a change to the docs, the tests or CI
 - **minor** — a new command, a new flag, or a new export overlay
 - **major** — a removed or renamed flag, a changed exit code, a changed
   collected-file naming scheme, or a changed `tx export` overlay format

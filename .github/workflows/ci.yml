@@ -158,3 +158,35 @@ jobs:
           tx check
           tx hints > /dev/null
           tx help > /dev/null
+
+  # Every change moves the version (CLAUDE.md; shared_tools BN-002, whose
+  # templates/version-job.yml this is, with this workflow's checkout@v4).
+  # The first step fails when pyproject.toml, __init__.py and tx.py disagree,
+  # or CHANGELOG.md does not open with that version, numbered and dated. On
+  # a pull request the second fails unless the version is greater than the
+  # base branch's. On a push to main the third fails unless it is greater
+  # than what main was before the push: two pull requests that each took the
+  # same number pass their own checks and are caught only there.
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every place the version is written agrees
+        run: bash tests/check_version.sh
+      - name: The version moved past the base branch's
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          git fetch --depth=1 origin "$BASE"
+          bash tests/check_version.sh FETCH_HEAD
+      - name: The version moved past main's before this push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$BEFORE" in ''|0000000000000000000000000000000000000000) exit 0 ;; esac
+          git fetch --depth=1 origin "$BEFORE"
+          bash tests/check_version.sh FETCH_HEAD

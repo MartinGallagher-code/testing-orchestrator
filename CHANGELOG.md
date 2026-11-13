@@ -9,9 +9,21 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-11-13
+
+Everything since 1.0.0, numbered and dated: what had collected under an
+"Unreleased" heading, and the rule that ends that heading (ST-030). From
+here on every change moves the version.
 
 ### Changed
+
+- **Every change moves the version.** A pull request into `main` raises the
+  version in all three places it is written (`pyproject.toml`,
+  `testing_orchestrator/__init__.py`, `testing_orchestrator/tx.py`) and opens
+  this file with that version's own dated section, never an "Unreleased"
+  heading left for later: the owner's rule for every repository in the suite
+  (shared_tools BN-002). `PUBLISHING.md` says so too. Bumping is now part of
+  every pull request, and publishing stays a separate, manual step.
 
 - **Shorter help.** `--help` no longer prints the whole README: it gives the
   quick-start commands and the list of commands. Each option's help now fits on
@@ -40,6 +52,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     passes in all of them.
 
 ### Added
+
+- **`tests/check_version.sh`, and a `version` job in CI.** The check fails
+  when the three places disagree, or when this file does not open with that
+  version, numbered and dated, or still holds an "Unreleased" heading. Given
+  a commit it also fails unless the version is greater than that commit's.
+  CI's `version` job runs it on every pull request against the base branch,
+  and on every push to `main` against what `main` was before the push. The
+  script is shared_tools' `templates/check_version.sh`: only its list of
+  places is this repository's.
+
+- **`CLAUDE.md`**, notes for a Claude session working here. Its work goes
+  through a ticket on the shared board in `MartinGallagher-code/shared_tools`.
+  It is not shipped: `MANIFEST.in` leaves it out of the sdist.
 
 - **Ready to publish on PyPI, with docs on Read the Docs.** A trusted-
   publishing workflow (`.github/workflows/publish.yml`, OIDC, no stored
