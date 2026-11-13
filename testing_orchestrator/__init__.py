@@ -8,4 +8,4 @@ copied to every host and run there as the agent. This package exists so
 `pip install` can put `tx` on your PATH.
 """
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"

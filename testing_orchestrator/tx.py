@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
