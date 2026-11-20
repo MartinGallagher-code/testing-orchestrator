@@ -49,7 +49,15 @@ reboot_host() {
     local pid kids k
     pid="$(cat "$FAKE_ROOT/$1$TX_REMOTE_DIR/agent.pid" 2>/dev/null)"
     [ -n "$pid" ] || { fail "host $1 has no agent.pid"; return 1; }
-    kids="$(pgrep -P "$pid")"
+    # The agent's children, from /proc: CI's python:3.6-slim has no pgrep.
+    kids="$(python3 -c 'import os, sys
+for p in os.listdir("/proc"):
+    try:
+        f = open("/proc/%s/stat" % p).read()
+    except (IOError, OSError, ValueError):
+        continue
+    if f.rsplit(")", 1)[-1].split()[1] == sys.argv[1]:
+        print(p)' "$pid")"
     kill -9 "$pid" 2>/dev/null
     for k in $kids; do
         kill -9 -- "-$k" 2>/dev/null
