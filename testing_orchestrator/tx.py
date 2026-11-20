@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1.0"
+VERSION = "1.1.3"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -246,6 +246,22 @@ def parse_token(tok):
     return tok, tok
 
 
+def host_problem(name, addr):
+    """Why a host's name or address cannot be used, or "" when it can.
+
+    The address is ssh's and scp's destination argument, and one that
+    starts with '-' is read as an option instead: `-oProxyCommand=...`
+    runs a command on this machine, `-F FILE` reads another ssh config.
+    The name goes to the agent as `--host NAME` and into every collected
+    file's name, where a '/' is a directory that does not exist.
+    """
+    if name.startswith("-") or addr.startswith("-"):
+        return "starts with '-', which ssh would read as an option"
+    if "/" in name:
+        return "has a '/', which cannot be part of a collected file's name"
+    return ""
+
+
 TAG_RE = re.compile(r"[^A-Za-z0-9._+-]+")
 
 
@@ -321,6 +337,10 @@ def load_plan(path):
         addr = cp.get("hosts", name).strip() or name
         if name in addrs:
             die("%s: duplicate host %r" % (path, name))
+        why = host_problem(name, addr)
+        if why:
+            die("%s: host %r %s" % (path, name if name == addr
+                                     else "%s = %s" % (name, addr), why))
         hosts.append(name)
         addrs[name] = addr
     if not hosts:
@@ -441,6 +461,9 @@ class Fleet(object):
     def __init__(self, plan, args):
         self.plan = plan
         self.user = args.user
+        if (self.user or "").startswith("-"):
+            die("--user %r starts with '-', which ssh would read as an "
+                "option" % self.user)
         self.jobs = max(1, args.jobs)
         self.dir = getattr(args, "remote_dir", "") or plan.remote_dir
         self.python = args.python
@@ -688,6 +711,11 @@ def _run_phase(command, cwd, env, logpath, timeout):
     return p.returncode
 
 
+# How long a phase that hit its timeout is given to go after SIGTERM,
+# before SIGKILL.
+KILL_GRACE = 5.0
+
+
 def _kill_group(p):
     """Kill the process *group*, not just the child.
 
@@ -703,7 +731,7 @@ def _kill_group(p):
             p.terminate()
         except OSError:
             pass
-    deadline = time.time() + 5.0
+    deadline = time.time() + KILL_GRACE
     while time.time() < deadline:
         if p.poll() is not None:
             return
@@ -995,6 +1023,10 @@ cd "$d" 2>/dev/null || {{ echo 'not deployed (run tx start without --no-deploy)'
 if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
     echo 'already running -- tx stop first'; exit 1
 fi
+# An earlier run's record must not answer for this one. With --no-deploy
+# nothing else removes it, and an agent that died on startup then read
+# as 'ran already' -- and its old exit 0 as this run passing.
+rm -f {report}
 {launch}
 agent_pid=$!
 echo "$agent_pid" > {pid}
@@ -1254,6 +1286,10 @@ def _collect_status(fleet):
     return out
 
 
+# The states a run record is in while its agent is still at work.
+UNFINISHED = ("armed", "running", "setup", "tidying")
+
+
 def _has_result(entry):
     """Has this host already run the job and recorded how it went?
 
@@ -1277,11 +1313,15 @@ def _still_working(entry):
     have no result yet, but starting them again would trample live work
     and throw away the run that is already most of the way done. They
     are waited for, not restarted.
+
+    A record that says it is still working is believed only while its
+    agent is alive. One that stopped mid-job -- a reboot, an OOM kill --
+    leaves "running" in run.json for good; reading that as live work
+    left the host out of every resumed sweep, waited on and never run.
     """
     alive, report, word = entry
     if report is not None:
-        return report.get("state") in ("armed", "running", "setup",
-                                       "tidying")
+        return alive and report.get("state") in UNFINISHED
     return alive or word == "NOT-STARTED-YET"
 
 
@@ -1699,13 +1739,19 @@ def render_summary(plan, states, args, waves=0):
     never answered. So a wave records what it saw while it could, and
     this renders the lot.
     """
-    reports, missing = [], []
+    reports, missing, gone = [], [], []
     for host in plan.hosts:
-        _alive, report, word = states[host]
+        alive, report, word = states[host]
         if report is None:
             missing.append((host, word or "no result"))
-        else:
-            reports.append(report)
+            continue
+        reports.append(report)
+        # A record that stopped mid-job with no agent behind it: a reboot,
+        # an OOM kill. Nothing more is coming from that host, so it is a
+        # host without a result -- not one "still going", which is what
+        # it was reported as, with an exit status of 0.
+        if not alive and report.get("state") in UNFINISHED:
+            gone.append((host, report))
 
     passed = [r for r in reports if r.get("exit") == 0
               and not r.get("timed_out")]
@@ -1714,9 +1760,9 @@ def render_summary(plan, states, args, waves=0):
     timed = [r for r in reports if r.get("timed_out")]
     setup_bad = [r for r in reports if r.get("state") == "setup-failed"]
     never = [r for r in reports if r.get("state") == "launch-failed"]
-    unfinished = [r for r in reports
-                  if r.get("state") in ("running", "armed", "setup",
-                                        "tidying")]
+    gone_ids = set(id(r) for _h, r in gone)
+    unfinished = [r for r in reports if r.get("state") in UNFINISHED
+                  and id(r) not in gone_ids]
 
     log("")
     log("tx -- %s   [%s]" % (plan.run, plan.tag))
@@ -1808,6 +1854,11 @@ def render_summary(plan, states, args, waves=0):
         log("  RUNNING   %d host(s) are still going: %s"
             % (len(unfinished),
                " ".join(r["host"] for r in unfinished[:8])))
+    if gone:
+        log("  GONE      %d host(s) stopped mid-job and left no result: %s"
+            % (len(gone), " ".join(h for h, _r in gone[:8])))
+        log("            the agent is not running (a reboot? an OOM "
+            "kill?); tx logs brings back what it said.")
     if missing:
         log("  NO RESULT %d host(s) said nothing:" % len(missing))
         for host, why in missing[:args.top]:
@@ -1822,12 +1873,14 @@ def render_summary(plan, states, args, waves=0):
         log("            those hosts may not be as you found them.")
 
     log("")
-    if not (failed or timed or missing or setup_bad or unfinished or never):
+    if not (failed or timed or missing or setup_bad or unfinished or never
+            or gone):
         log("[tx] every host ran the job and exited zero.")
     if not waves:
         log("[tx] next: tx collect     # the results themselves")
         log("[tx]       tx clean       # remove every trace")
-    return 0 if not (failed or timed or missing or setup_bad or never) else 1
+    return 0 if not (failed or timed or missing or setup_bad or never
+                     or gone) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1921,15 +1974,31 @@ fi
 # run: the whole thing
 # ---------------------------------------------------------------------------
 
+def _job_bound(plan, nhosts, start_in):
+    """The longest a host can take, from arming to its last record.
+
+    The job's timeout, and the arming window -- but setup and teardown
+    are bounded separately, each by the same timeout (setup by whatever
+    of it is left at the armed instant), and each can be killed at its
+    limit and given KILL_GRACE to go. A bound that counted only the job
+    gave up on hosts still within their budget: a wave reported them
+    unfinished and started the next wave over them, which is the one
+    thing --batch exists to prevent.
+    """
+    extra = (1 if plan.setup else 0) + (1 if plan.teardown else 0)
+    return (arm_delay(nhosts, start_in) + plan.timeout
+            + extra * (plan.timeout + KILL_GRACE))
+
+
 def _wait_deadline(args, plan):
     """When to stop waiting for a set of hosts.
 
-    A fleet cannot take longer than its own timeout plus the arming
-    window, so waiting past that means something is wrong rather than
-    slow -- and an unbounded wait is how a script hangs forever.
+    A fleet cannot take longer than its own bound (`_job_bound`), so
+    waiting past that means something is wrong rather than slow -- and
+    an unbounded wait is how a script hangs forever.
     """
-    return (time.time() + plan.timeout
-            + arm_delay(len(plan.hosts), args.start_in) + 60)
+    return (time.time() + _job_bound(plan, len(plan.hosts), args.start_in)
+            + 60)
 
 
 def cmd_run(args):
@@ -2242,7 +2311,10 @@ def muster_lease(args, plan):
     """
     if args.lease:
         return args.lease
-    bound = plan.timeout + arm_delay(args.batch, args.start_in) + 60
+    # The whole of the agent's own bound, setup and teardown included: a
+    # host that overran a job-only bound was still working when its item
+    # went back to the pool.
+    bound = _job_bound(plan, args.batch, args.start_in) + 60
     return "%ds" % int(bound * 2 + 300)
 
 
@@ -2300,6 +2372,22 @@ def run_from_muster(args, plan):
                 log("[tx] %d item(s) came back with a lapsed lease; holding "
                     "them rather than running them a second time" % len(again))
                 holding.append((head, again))
+            # An item the pool hands out is not necessarily something ssh
+            # can be pointed at: '-oProxyCommand=...' as a destination is
+            # an option, and a '/' crashed the collection with the item
+            # still held. Those are not run; they go back with the rest.
+            unusable = [i for i in fresh
+                        if host_problem(i, muster_addr(plan, i))]
+            if unusable:
+                for item in unusable:
+                    log("[tx] not running pool item %r: it %s"
+                        % (item, host_problem(item, muster_addr(plan, item))))
+                holding.append((head, unusable))
+                seen.update(unusable)
+                trouble.append(0)
+                fresh = [i for i in fresh if i not in set(unusable)]
+                if not fresh:
+                    continue
             if not fresh:
                 if not items:
                     log("[tx] the pool has nothing available.")
@@ -2645,18 +2733,44 @@ def _export_state(report, word):
     return "RUNNING"
 
 
-def _read_collected_reports(path):
+def _record_tag(name, host):
+    """The tag in a collected record's file name, or None when `name` is not
+    where `tx collect` puts `host`'s record.
+
+    A collection also holds whatever the job wrote, flattened the same way,
+    so a job's own `out/run.json` lands as `tag~host~out~run.json`. Only
+    `tag~host~run.json` (or a lone `run.json`) is the agent's record; the
+    rest is the job's, whatever it holds.
+    """
+    if name == REPORT_NAME:
+        return ""
+    suffix = FLAT_SEP + host + FLAT_SEP + REPORT_NAME
+    if not name.endswith(suffix):
+        return None
+    tag = name[:-len(suffix)]
+    if not tag or FLAT_SEP in tag:
+        return None
+    return tag
+
+
+def _read_collected_reports(path, want_tag=None):
     """`--from DIR`: {host: report} from the run.json files a collection holds.
 
     `tx collect` writes each host's record as `tag~host~run.json`, so the
     records are already here -- export reads them rather than ssh'ing the
-    fleet again. The host is taken from inside the record, not the filename,
-    so a tag or a host with an unusual character cannot misfile a sample.
+    fleet again. The host is taken from inside the record, and the file
+    has to be where collect would have put that host's record, so a tag or
+    a host with an unusual character cannot misfile a sample and a job's
+    own file called run.json is not taken for one.
+
+    The tag is what lets several runs share a directory, so a directory
+    holding more than one is read for `want_tag` (the plan's) alone: taking
+    whichever record sorted last mixed two runs' numbers into one export.
     """
     if not os.path.isdir(path):
         die("--from %s: not a directory (point it at a `tx collect` "
             "directory)" % path)
-    reports = {}
+    by_tag = {}
     for name in sorted(os.listdir(path)):
         if not name.endswith(FLAT_SEP + REPORT_NAME) and name != REPORT_NAME:
             continue
@@ -2667,16 +2781,36 @@ def _read_collected_reports(path):
         except (IOError, OSError, ValueError) as exc:
             sys.stderr.write("[tx] export: skipping %s: %s\n" % (name, exc))
             continue
+        if not isinstance(report, dict):
+            sys.stderr.write("[tx] export: skipping %s: not a run record "
+                             "(JSON, but not an object)\n" % name)
+            continue
         host = report.get("host")
-        if not host:
-            sys.stderr.write("[tx] export: %s has no host field, skipping\n"
+        if not host or not isinstance(host, str):
+            sys.stderr.write("[tx] export: %s has no host name, skipping\n"
                              % name)
             continue
-        reports[host] = report
-    if not reports:
+        if not isinstance(report.get("state"), str):
+            sys.stderr.write("[tx] export: skipping %s: no state field, so "
+                             "not a run record\n" % name)
+            continue
+        tag = _record_tag(name, host)
+        if tag is None:
+            sys.stderr.write("[tx] export: skipping %s: not where tx collect "
+                             "puts %s's record\n" % (name, host))
+            continue
+        by_tag.setdefault(tag, {})[host] = report
+    if not by_tag:
         die("no run.json records in %s/ -- is it a `tx collect` directory?"
             % path, code=1)
-    return reports
+    if len(by_tag) == 1:
+        return list(by_tag.values())[0]
+    tags = ", ".join(sorted(t or "(untagged)" for t in by_tag))
+    if want_tag in by_tag:
+        return by_tag[want_tag]
+    die("%s/ holds the records of %d runs (tags: %s); export reads one -- "
+        "give --plan the plan whose tag you mean"
+        % (path, len(by_tag), tags))
 
 
 def cmd_export(args):
@@ -2686,12 +2820,18 @@ def cmd_export(args):
     # {host: (report-or-None, word-or-None)}, and the host order to walk.
     entries = {}
     if args.from_dir:
-        reports = _read_collected_reports(args.from_dir)
+        reports = _read_collected_reports(args.from_dir,
+                                          plan.tag if plan else None)
         for host, report in reports.items():
             entries[host] = (report, None)
         # The plan, when there is one, is the roll call: a host it names that
-        # the collection has no record of never made it back.
-        hosts = list(plan.hosts) if plan else sorted(reports)
+        # the collection has no record of never made it back. It is not a
+        # filter -- a --muster sweep runs items the plan never names, and
+        # their records are as much the run's as any.
+        hosts = sorted(reports)
+        if plan:
+            hosts = list(plan.hosts) + [h for h in hosts
+                                        if h not in plan.addrs]
         for host in hosts:
             entries.setdefault(host, (None, "NO-DATA"))
     else:
@@ -2708,6 +2848,10 @@ def cmd_export(args):
     if args.run and any(c in args.run for c in BAD_IN_FIELD):
         die("--run %r: the label is written onto every sample line, so it "
             "can hold no whitespace or quotes" % args.run)
+    if any(c in args.test_prefix for c in BAD_IN_FIELD):
+        die("--test-prefix %r: it leads every test name in a whitespace "
+            "separated file, so it can hold no whitespace or quotes"
+            % args.test_prefix)
 
     out = Overlay(test_prefix=args.test_prefix,
                   target_prefix=args.target_prefix,
@@ -2812,6 +2956,9 @@ def cmd_gen(args):
         if name in seen:
             die("%s: %r is listed twice; a host's results would land on top "
                 "of each other" % (args.servers, name))
+        why = host_problem(name, addr)
+        if why:
+            die("%s: host %r %s" % (args.servers, tok, why))
         seen.add(name)
 
     if not args.run:

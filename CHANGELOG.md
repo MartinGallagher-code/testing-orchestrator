@@ -9,6 +9,68 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.3] - 2026-11-20
+
+An adversarial pass over the sweeps (`--batch`, `--resume`, `--muster`),
+`tx export`, the exit codes and Ctrl-C (shared_tools TX-004). Every fix
+has a regression test in `tests/test_adversarial.sh`, and
+`tests/test_adversarial_mutations.sh` undoes each one in a copy of `tx.py`
+and checks its test fails. 1.1.1 and 1.1.2 are the numbers TX-001 and
+TX-003 took while this was open beside them; whichever merges later
+rebases and bumps again.
+
+### Fixed
+
+- **A host whose agent died mid-job no longer reads as "still going".**
+  A reboot or an OOM kill leaves `running` in `run.json` for good. `tx run`
+  reported that host as `RUNNING ... still going` and exited 0; it is now
+  `GONE ... stopped mid-job and left no result`, and the run exits 1, as
+  the exit-status table always said. `tx summarize` likewise.
+- **`--resume` runs such a host again** instead of waiting on it: it
+  believed the record's "running" without asking whether the agent was
+  alive, so the host was never covered, on every resume after. A
+  `--muster` wave likewise puts the item back for somebody else rather
+  than holding it, with nothing running, until its lease ran out.
+- **An earlier run's record no longer answers for this one.** With
+  `--no-deploy` the last run's `run.json` stayed on the host, and an
+  agent that died on startup read as "ran already" — and its old exit 0
+  as this run passing everywhere (`tx run` and `--muster`, which checked
+  the items in as done). The start now removes it before launching.
+- **The wait, and the default `--lease`, count setup and teardown.** Each
+  has the job's timeout of its own, so a host can take three times the
+  timeout. Counting only the job, a `--batch` wave was given up on while
+  its hosts were still in teardown and the next wave started over them —
+  two waves running at once — and from a timeout of about seven minutes the
+  default lease could run out under a host still working. Plans without
+  setup or teardown wait exactly as long as before.
+- **`tx export --from` reads only run records.**
+  - JSON that is not an object (an array, a string), a host that is not a
+    name, or a record with no state crashed it with a traceback, or was
+    read as a host. Each is now skipped with a message.
+  - A job's own `run.json` (collected as `tag~host~out~run.json`, or from
+    a `collect=` glob) was taken for the record, and one that sorted after
+    it replaced it. Only `tag~host~run.json` is the record now.
+  - A directory several tagged runs share was read as one run, each host's
+    numbers taken from whichever record sorted last. It is read for the
+    plan's tag, and refused (exit 2) without a plan to say which.
+  - Records for hosts the plan does not name — a `--muster` sweep's items
+    — were dropped without a word. The plan is the roll call, not a filter.
+  - `--test-prefix` with whitespace or a quote is refused, as `--run` is:
+    a space split the field, and a newline wrote lines of its own.
+- **A host name ssh would read as an option is refused.** A host or
+  address starting with `-` went to ssh and scp as an option, not a
+  destination (`-oProxyCommand=...` runs a command on this machine, `-F`
+  reads another config); a name with a `/` crashed the collection with a
+  traceback. `tx gen` and every command that reads the plan refuse them,
+  and a `--user` starting with `-`, before any ssh. A `--muster` pool item
+  like that is not run: it is named, put back, and the sweep exits 1.
+
+### Documentation
+
+- The exit-status table lists 130 (interrupted with Ctrl-C), and says the
+  agents already started keep running. What Ctrl-C should do is the
+  owner's decision, filed separately.
+
 ## [1.1.0] - 2026-11-13
 
 Everything since 1.0.0, numbered and dated: what had collected under an
