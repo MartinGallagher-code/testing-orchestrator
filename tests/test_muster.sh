@@ -333,6 +333,25 @@ t_items_nothing_reached_go_back_not_done() {
     assert_contains "$(muster list --pool "$pool")" "a,available"
 }
 
+t_a_wave_that_cannot_be_cleaned_is_counted() {
+    # The clean after a wave used to be fire-and-forget. A host it left as
+    # it was is worth an exit code now -- and changes nothing about the
+    # check-in: the item ran, so it is done.
+    install_fake_ssh
+    install_fake_muster
+    pool="$(make_pool a b)"
+    plan="$(sweep_plan a b)"
+    mkdir -p "$FAKE_ROOT/a$TX_REMOTE_DIR"
+    echo mine > "$FAKE_ROOT/a$TX_REMOTE_DIR/notes.txt"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --start-in 1 \
+        --no-skew-check -d results --clean --quiet
+    assert_status 1 "$RUN_RC" "a wave that could not be cleaned is worth an exit code"
+    assert_contains "$RUN_OUT" "REFUSED"
+    assert_eq "pool.csv,2,2,0,0,100.00,0" \
+        "$(muster status --pool "$pool" --csv | tail -1)"
+    assert_no_file "$FAKE_ROOT/b$TX_REMOTE_DIR" "b should be cleaned"
+}
+
 # ---- a shared pool: another worker's items are left alone -----------------
 
 t_items_another_worker_holds_are_left_alone() {
@@ -415,6 +434,7 @@ run_test "a batch bigger than the pool"        t_a_batch_bigger_than_the_pool_is
 run_test "the pool decides the work"           t_pool_items_the_plan_does_not_name_are_still_run
 run_test "an item that ran is done"            t_an_item_that_ran_is_done_and_the_report_agrees
 run_test "items nothing reached go back"       t_items_nothing_reached_go_back_not_done
+run_test "an uncleaned wave is counted"        t_a_wave_that_cannot_be_cleaned_is_counted
 run_test "another worker's items are left"     t_items_another_worker_holds_are_left_alone
 run_test "an empty pool runs nothing"          t_an_empty_pool_runs_nothing
 run_test "the pool's own status is printed"    t_the_pools_own_status_is_printed_at_the_end

@@ -189,6 +189,44 @@ t_a_wave_that_cannot_start_is_named_not_skipped_silently() {
     assert_contains "$RUN_OUT" "wave 2 of 2"
 }
 
+# A file of somebody else's in HOST's working directory, put there before
+# the sweep reaches it: the clean after that host's wave refuses over it.
+strangers_file() {
+    mkdir -p "$FAKE_ROOT/$1$TX_REMOTE_DIR"
+    echo mine > "$FAKE_ROOT/$1$TX_REMOTE_DIR/notes.txt"
+}
+
+t_a_wave_that_cannot_be_cleaned_is_counted() {
+    # Each wave's --clean used to be fire-and-forget: a host left exactly
+    # as it was still ended in exit 0. It counts now, and the sweep goes
+    # on -- the next wave is other hosts.
+    install_fake_ssh
+    plan="$(sweep_plan a b c d)"
+    strangers_file a
+    run_tx run --plan "$plan" --batch 2 --start-in 1 --no-skew-check \
+        -d results --clean --quiet
+    assert_status 1 "$RUN_RC" "a wave that could not be cleaned is worth an exit code"
+    assert_contains "$RUN_OUT" "REFUSED"
+    assert_contains "$RUN_OUT" "covered 4 of 4 hosts"
+    assert_file_exists "results/sweep~d~out~who" "the next wave should still run"
+    for h in b c d; do
+        assert_no_file "$FAKE_ROOT/$h$TX_REMOTE_DIR" "$h was not cleaned"
+    done
+    assert_file_exists "$FAKE_ROOT/a$TX_REMOTE_DIR/notes.txt"
+}
+
+t_stop_on_fail_stops_at_a_wave_that_cannot_be_cleaned() {
+    install_fake_ssh
+    plan="$(sweep_plan a b c d)"
+    strangers_file a
+    run_tx run --plan "$plan" --batch 2 --start-in 1 --no-skew-check \
+        -d results --clean --stop-on-fail --quiet
+    assert_status 1 "$RUN_RC"
+    assert_contains "$RUN_OUT" "not starting the remaining waves"
+    assert_contains "$RUN_OUT" "NOT REACHED"
+    assert_no_file "results/sweep~c~out~who" "the sweep should have stopped"
+}
+
 # ---- resume: the fleet is the record ----------------------------------------
 
 # Start a sweep in the background and return the ORCHESTRATOR's pid.
@@ -357,6 +395,8 @@ run_test "the spread does not overclaim"       t_the_spread_does_not_claim_the_w
 run_test "a failing job does not stop it"      t_a_failing_job_does_not_stop_the_sweep
 run_test "stop-on-fail names the unreached"    t_stop_on_fail_stops_and_says_who_was_never_reached
 run_test "a wave that cannot start is named"   t_a_wave_that_cannot_start_is_named_not_skipped_silently
+run_test "an uncleaned wave is counted"        t_a_wave_that_cannot_be_cleaned_is_counted
+run_test "stop-on-fail stops at an unclean"    t_stop_on_fail_stops_at_a_wave_that_cannot_be_cleaned
 run_test "a killed sweep is resumed"           t_a_killed_sweep_is_resumed_from_the_fleets_own_record
 run_test "resume waits for live work"          t_resume_waits_for_hosts_still_running_rather_than_restarting_them
 run_test "resuming a finished sweep"           t_resuming_a_finished_sweep_does_nothing

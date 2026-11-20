@@ -9,6 +9,71 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-11-20
+
+`tx stop`, `tx clean`, `tx doctor` and `tx status` act on this run's own
+agent and this run's own files, and nothing else (TX-001). These are the
+fixes `matrix_orchestrator` made in 1.11.2 to 1.11.7 and
+`iperf_orchestrator` in 2.8.0, ported, with the owner's decisions for
+those two taken as made for `tx`. No flag, exit code, collected-file name
+or export format changes.
+
+### Fixed
+
+- **`tx stop` of one run no longer kills another run's agent.** It waited
+  on *any* `tx.py agent` on the host, found the second run's (out of
+  another `--remote-dir`, running as it should), and after ten seconds
+  `pkill -KILL`ed it. `stop`, `clean`, `run --clean`, each wave's clean and
+  the stand-down after a failed start all went through that code. Now a pid
+  is signalled, waited on and killed only once it is shown to be a live
+  `tx.py agent` whose working directory (`/proc/PID/cwd`) is this
+  `--remote-dir`; an agent that will not go is KILLed with its own
+  children, not with every agent on the host.
+- **A stale `agent.pid` is not trusted.** The default `/var/tmp/tx`
+  survives a reboot, and the pid in it could have been reused by anything
+  of the ssh user's. `tx start` refused to deploy over it ("already
+  running"), `tx status` called the host alive, and `tx stop` ran
+  `kill -TERM -<pid>` — that process's whole process group. Now such a pid
+  is "not running", and is never signalled.
+- **A lost `agent.pid` is traced by working directory**, read from `/proc`
+  itself (no procps needed), rather than `pkill -TERM`ing every tx agent of
+  the ssh user. On a host with no `/proc` (macOS), with `agent.pid` gone and
+  a tx agent of yours running, `stop` and `clean` fail on that host and say
+  to kill it by hand; nothing is killed by name, and `clean` leaves the
+  directory in place.
+- **`tx clean` deletes only what tx put there.** It ran `rm -rf` on
+  whatever `--remote-dir` named. It now removes tx's own files, what the
+  payload unpacked (each top-level name the deploy *created*, recorded in
+  `.tx-manifest`), and what the run left beside them (recorded by the agent
+  as the run ends) — and then `rmdir`s the directory. Anything else there
+  makes it refuse on that host, name what it found, and delete nothing. A
+  payload that brings its own `.tx-manifest` is refused by `tx start`.
+  *Upgrading:* a directory deployed by 1.1.0 or earlier has no record, so
+  the first `tx clean` of one names its contents and leaves it; delete it
+  by hand once.
+- **`tx clean` reports `LEFTOVER` only for an agent of this run** still
+  running out of its directory, and deletes nothing under it. Another
+  run's agent, or another user's, made it exit 1 before.
+- **`tx doctor`'s `agent_running`** is this `--remote-dir`'s agent, not any
+  tx agent on the host. It also reports `proc=`: whether a lost
+  `agent.pid` can be traced there.
+- **`tx run --clean` exits 1 when its clean failed** on any host — plain,
+  `--batch` and `--muster` alike. It dropped clean's answer. In a sweep the
+  next wave still runs; with `--stop-on-fail` a wave that could not be
+  cleaned is the last.
+
+### Tests
+
+- Two runs on the same fake hosts: stopping, cleaning, or stopping with a
+  lost pid file one of them leaves the other running to the end; `clean`
+  and `doctor` beside another run; a stale pid file naming a process group
+  of somebody else's; a host with no `/proc`; a stranger's file, a
+  directory the payload did not create, and everything a run made;
+  `run --clean` (plain, `--batch`, `--muster`) whose clean fails.
+- `tests/test_mutations.sh`: each fix reverted in a copy of `tx.py`, and the
+  test written for it shown to fail by name. `TX_TEST_ONLY` runs chosen
+  tests of a file, which is how it runs one test against a copy.
+
 ## [1.1.0] - 2026-11-13
 
 Everything since 1.0.0, numbered and dated: what had collected under an
