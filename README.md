@@ -96,7 +96,8 @@ And more when you want them: `tx run` (all of the above in one shot, and
 `--batch N` to cover the fleet a few hosts at a time), `tx export` (the
 run as a floor-plan overlay — see [Draw it on the floor
 plan](#draw-it-on-the-floor-plan-tx-export)), `tx check` (will this plan
-work? no ssh needed), `tx doctor` (is the fleet ready?), `tx stop` (end
+work? no ssh needed), `tx doctor` (is the fleet ready, and is each host's
+working directory safe to use?), `tx stop` (end
 the job, keep what it made), `tx logs` (collect the agents' own logs),
 and `tx hints` (goal → command).
 
@@ -572,6 +573,49 @@ indented, and it arrives on the far side exactly as typed. It travels
 base64'd from the plan to the agent, so no shell parses it on the way:
 quotes, newlines, `$(...)` and backslashes all survive.
 
+### Whose working directory it is
+
+`remote_dir` (`--remote-dir`, default `/var/tmp/tx`) is where the agent and
+the payload land, where the job runs and where its results wait to be
+collected. `/var/tmp` is writable by every user on a host, so anyone could
+make `/var/tmp/tx` before tx does — and whoever owns that directory, or can
+write to it, could swap `tx.py` between the copy and the launch and have
+their code run as you, plant an `agent.pid` for `tx stop` to kill, or leave
+a symlink where the copy writes.
+
+So before any command writes to it, runs from it, reads from it, stops
+what it names or deletes it, each host checks that the directory is:
+
+- a real directory — not a symlink, not a file;
+- owned by the ssh user;
+- writable by nobody else — no group-write, no other-write bit.
+
+A host where it is not fails with a line that says why, and nothing in the
+directory is touched:
+
+```text
+  web02  REFUSED: --remote-dir /var/tmp/tx is owned by mallory (uid 1002), mode drwxrwxrwx; the ssh user is uid 1000: it is not owned by the ssh user; others can write to it; its group can write to it. tx will not deploy to it, ...
+[tx] FAILED on 1/2 hosts: web02
+```
+
+Remove it, `chmod go-w` it, or pick another `--remote-dir`. A directory tx
+makes itself is made `0700`; one that is already there keeps its mode.
+`tx doctor` gives every host's answer before a run (`remote_dir=ok`,
+`absent`, or the `REFUSED:` line), and `tx status` shows the `REFUSED:` line
+in place of that host's state.
+
+The copy itself goes into a private `.tx-incoming.*` directory inside the
+checked one and is renamed into place, and the launch checks the
+directory again in the same breath as it runs the agent — so nothing that
+changed between the copy and the start is run.
+
+**A directory a group shares on purpose** can be let through with
+`--allow-shared-remote-dir` (or `TX_ALLOW_SHARED_REMOTE_DIR=1`). It lifts
+the group-write check only: the directory must still be the ssh user's
+own, not a symlink, and not writable by everyone. Anyone in that group can
+still change what runs, so use it only for a group you trust with your
+login.
+
 ---
 
 ### What `tx clean` will and won't promise
@@ -603,7 +647,8 @@ whether `stop` and `clean` will be able to verify themselves.
 
 Each is the default for the matching flag: `TX_PLAN`, `TX_SERVERS`,
 `TX_REMOTE_DIR`, `TX_DIR`, `TX_USER` (or `SSH_USER`), `TX_JOBS`,
-`TX_PYTHON`.
+`TX_PYTHON`, and `TX_ALLOW_SHARED_REMOTE_DIR=1` for
+`--allow-shared-remote-dir`.
 
 ---
 
