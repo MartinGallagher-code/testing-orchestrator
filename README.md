@@ -392,6 +392,28 @@ and `stdin` from the plan's `stdin =` file, or `/dev/null`.
 tx gen --servers servers.txt --run './shard.sh $TX_INDEX $TX_NHOSTS' --peers
 ```
 
+### The payload cannot break the agent
+
+The agent is `tx.py` itself, copied into the working directory beside the
+unpacked payload. It never imports anything the job shipped: it is started
+as `python3 -I tx.py agent …`, and Python's isolated mode leaves the
+script's own directory off `sys.path` and ignores `PYTHON*` variables, for
+the agent's interpreter only. Before 1.1.1 a payload with a top-level
+`json.py`, `queue.py`, `signal.py` or `subprocess.py` replaced that
+standard module in the agent, which died on startup on every host and said
+only that it had.
+
+The job is not isolated. It runs in the payload directory with the
+environment the agent was given, `PYTHONPATH` included, so a `bench.py`
+that does `import helper` finds the `helper.py` beside it, exactly as when
+you run it there yourself. That is also why `tx check` does not warn about
+a payload `json.py`: it can no longer reach the agent, and what the job
+imports from its own directory behaves on the hosts as it does on your
+machine.
+
+`--python` (or `TX_PYTHON`) must accept `-I`, as every CPython since 3.4
+does; the 3.6 floor already guarantees it.
+
 ---
 
 ## Results that stay apart

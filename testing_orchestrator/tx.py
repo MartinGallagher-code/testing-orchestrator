@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -986,7 +986,16 @@ def _start_script(fleet, plan, args, host, at, index, run_id):
     # descriptors redirected: $! is then the agent's own pid, and nothing
     # is left holding ssh's channel open -- background an `A && B` list
     # instead and ssh hangs until the agent exits.
-    launch = ("nohup %s %s %s < /dev/null >> %s 2>&1 &"
+    #
+    # -I (isolated mode, 3.4+) keeps the payload out of the agent. tx.py
+    # sits in the directory the payload unpacks into, and a plain
+    # `python3 tx.py` puts that directory first on sys.path, so a job that
+    # shipped its own json.py or queue.py had the agent import it and die
+    # on startup on every host. -I leaves the script's directory off the
+    # path and ignores PYTHON* variables, for this interpreter only:
+    # os.environ is untouched, so the job, which the agent starts in that
+    # same directory with that environment, sees exactly what it did.
+    launch = ("nohup %s -I %s %s < /dev/null >> %s 2>&1 &"
               % (shlex.quote(fleet.python), shlex.quote(agent),
                  " ".join(shlex.quote(f) for f in flags), LOG_NAME))
     return """
