@@ -219,7 +219,10 @@ killed before its results were fetched has them on the host and nothing
 here. A host still working is one the interrupted sweep left running:
 agents are detached, so the work outlived the orchestrator, and
 restarting it would trample a run that is nearly finished. Only what is
-neither gets covered in fresh waves.
+neither gets covered in fresh waves — including a host whose record
+stopped mid-job with no agent left behind it (a reboot, an OOM kill):
+that host has no result and nothing is coming, so it is run again
+rather than waited on.
 
 ### How often it asks
 
@@ -290,10 +293,19 @@ The pool decides *which* items and in what order; the plan stays the
 **address book**. An item the plan names is reached at the address the
 plan gives it (so a fleet can sit behind aliases); an item the plan does
 not name is its own address, so a pool of bare hostnames works against a
-plan that lists none of them.
+plan that lists none of them. The pool is somebody else's file, so an item
+that cannot be a host is not run: one starting with `-` (ssh would read it
+as an option — `-oProxyCommand=…` runs a command on your machine) or one
+with a `/` (it cannot be part of a collected file's name). It is named and
+put back, and the sweep exits 1.
 
 `--lease` sets how long each wave holds its items; the default is twice
 the wave's own time bound, so a lease always outlasts the work it covers.
+That bound is the job's timeout plus the arming window, and the timeout
+again for `setup=` and again for `teardown=` when the plan has them: each
+phase is bounded by the timeout on its own, so a host can legitimately
+take that long, and `tx run` waits that long for a wave before calling it
+unfinished.
 Too short, and an item goes back to the pool while tx is still running it
 — the one thing the lease exists to prevent. `--muster-cmd` names how to
 invoke muster when it is not simply `muster` on the `PATH`.
@@ -539,9 +551,20 @@ collection instead:
 tx export --from results >> results.tsv
 ```
 
+It reads each host's record from the name `tx collect` gives it,
+`tag~host~run.json`; anything else called `run.json` — a job's own
+`out/run.json`, say — is the job's, not a record, and is skipped. A
+directory that several tagged runs share is read for the plan's tag, and
+refused without a plan to say which. A host with a record that the plan
+does not name (a `--muster` item) is exported too: the plan is the roll
+call, not a filter.
+
 `--names FILE` maps tx host names to the layout's, `--target-prefix DH1/A/`
-addresses nodes by path, `--run LABEL` tags every sample, and `--json`
-writes NDJSON for a pipeline rather than a person.
+addresses nodes by path, `--test-prefix` replaces `tx_`, `--run LABEL` tags
+every sample, and `--json` writes NDJSON for a pipeline rather than a
+person. The prefixes and the label land on every line of a
+whitespace-separated file, so one holding whitespace or a quote is
+refused.
 
 ---
 
@@ -566,6 +589,12 @@ remote_dir = /var/tmp/tx
 web01 = 10.0.0.11
 web02 = 10.0.0.12
 ```
+
+A host's name and address may not start with `-`, which ssh and scp
+would read as an option rather than a destination, and a name may not
+hold a `/`, since it is part of every collected file's name. `tx gen`
+and every command that reads the plan refuse them, as they do a `--user`
+starting with `-`.
 
 A command spanning several lines is fine — continuation lines are
 indented, and it arrives on the far side exactly as typed. It travels
@@ -594,8 +623,9 @@ whether `stop` and `clean` will be able to verify themselves.
 | Code | Meaning |
 |---|---|
 | `0` | every host ran the job and exited zero, and everything came back |
-| `1` | a host failed, timed out, was never reachable, or nothing was collected |
+| `1` | a host failed, timed out, was never reachable, stopped mid-job without a result (`GONE`), or nothing was collected |
 | `2` | usage error |
+| `130` | interrupted (Ctrl-C). Agents already started are detached and keep running: `tx status` shows them, `tx collect` brings back what they made, `tx stop` stops them |
 
 ---
 
