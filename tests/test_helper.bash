@@ -27,7 +27,11 @@ setup_env() {
     mkdir -p "$FAKE_BIN" "$FAKE_ROOT"
     # Never let a stray environment leak into a test run.
     unset TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_JOBS TX_USER \
-          TX_PYTHON TX_SSH TX_SCP SSH_USER
+          TX_PYTHON TX_SSH TX_SCP SSH_USER TX_ALLOW_SHARED_REMOTE_DIR
+    # tx refuses a --remote-dir its group can write to (TX-002), so a test
+    # that makes one by hand must not get a group-writable one just because
+    # the runner's umask is 002.
+    umask 022
 }
 
 teardown_env() {
@@ -264,6 +268,11 @@ FAILED_TESTS=()
 # about the tool instead of a list of python-ish identifiers.
 run_test() {
     local label="$1" name="$2"; shift 2
+    # TX_ONLY=FUNC runs that one test of a file and skips the rest: how
+    # test_remote_dir_mutations.sh runs one test against a mutant.
+    if [ -n "${TX_ONLY:-}" ] && [ "$name" != "$TX_ONLY" ]; then
+        return 0
+    fi
     TESTS_RUN=$((TESTS_RUN + 1))
     setup_env
     local rc=0 limit="${TX_TEST_TIMEOUT:-0}" timed_out=0

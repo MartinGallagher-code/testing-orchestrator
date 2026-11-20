@@ -9,6 +9,66 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-20
+
+The `--remote-dir` is checked on every host before tx writes to it, runs
+from it, reads from it, signals what its pid file names or deletes it
+(shared_tools ticket TX-002). The same checks as matrix_orchestrator
+1.12.0 (MX-006) and iperf_orchestrator 2.7.0 (IO-003). This went in
+ahead of TX-001 (the 1.1.1 that limits `stop` and `clean` to tx's own
+agent and files), which had not been started; whichever merges second
+rebases onto the other and takes the next number.
+
+### Changed
+
+- **A `--remote-dir` that another user owns, or can write to, is
+  refused.** The default `/var/tmp/tx` sits in a world-writable directory,
+  so any user on a host can create it before tx does, and nothing checked
+  who owned it: `tx start` ran `mkdir -p` (taking the directory as it found
+  it), copied `tx.py` into it and ran it with `python3`. Whoever owned or
+  could write to that directory could swap `tx.py` or the payload between
+  the copy and the launch and so run their code as the ssh user, plant an
+  `agent.pid` for `tx stop` to signal, or leave a symlink where scp writes.
+  Now `start` (its copy, its rename into place and its launch, each checked
+  again), the stand-down after a failed arming, `status`, `stop`, `clean`,
+  `collect`, `logs`, `doctor`, `export`, `run` and every `--batch` or
+  `--muster` wave first check, on each host, that the directory is a real
+  directory (not a symlink, not a file), owned by the ssh user (`id -u`)
+  and not writable by group or others. If it is not, that host fails with
+  a `REFUSED:` line naming the directory, its owner and uid, its mode and
+  the ssh user's uid, and nothing in it is read, written, run, signalled or
+  deleted. **This refuses directories that worked before**: one another
+  user owns, one made group- or world-writable by hand (`chmod go-w` it),
+  and a symlinked `--remote-dir`, which `start` used to deploy through and
+  `clean` to delete through; give the real path instead.
+- **`tx status` prints a refused host's `REFUSED:` line where its state
+  would be.** It is a report, so it still exits 0, as it does for an
+  unreachable host; every other command fails that host and exits 1. No
+  exit code changed.
+- **A new `--remote-dir` is created private**, `mkdir -p -m 700`. A
+  directory that already exists keeps its mode, and so does any parent.
+- **The agent and the payload are copied into a private staging directory
+  (`.tx-incoming.*`) and renamed into place**, after whatever stood at the
+  agent's name is removed, so a symlink planted at `tx.py` is replaced,
+  never written through. The payload is unpacked straight out of the
+  stage, so `payload.tar.gz` is never written at its fixed name at all.
+  `agent.pid` is written to a temporary name and renamed into place too.
+- **`tx start` no longer replaces `tx.py` under a job that is still
+  running.** The "a job is already running here" check now comes before
+  the rename rather than after the copy.
+- **`tx doctor` reports each host's `--remote-dir`**: `remote_dir=ok(...)`
+  with its mode, `absent(start makes it, mode 700)`, or `REFUSED` with the
+  reason, and a refused host is not called ready. `tx check`, which
+  contacts no host, says what will be checked and points at `tx doctor`.
+
+### Added
+
+- **`--allow-shared-remote-dir`** (or `TX_ALLOW_SHARED_REMOTE_DIR=1`) on
+  every fleet command lets `--remote-dir` be group-writable, for a
+  directory a group shares on purpose. It lifts that one check: the
+  directory must still be the ssh user's, not a symlink, and not writable
+  by others. `tx hints` has an entry for it.
+
 ## [1.1.0] - 2026-11-13
 
 Everything since 1.0.0, numbered and dated: what had collected under an
