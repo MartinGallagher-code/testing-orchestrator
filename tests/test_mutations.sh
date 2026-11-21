@@ -153,9 +153,16 @@ m_stop_waits_on_any_agent() {
 }
 
 m_a_live_pid_is_trusted() {
-    # agent.pid trusted on `kill -0` alone, as it was.
-    mutant '    kill -0 "$1" 2>/dev/null || return 1' \
-           '    kill -0 "$1" 2>/dev/null && return 0' || return 1
+    # agent.pid trusted on `kill -0` alone, as the kill block had it.
+    #
+    # The pid file's own check, and not tx_ours itself: tx_scan puts every
+    # pid on the machine to tx_ours, so a tx_ours that says yes to any live
+    # pid makes a lost pid file "kill everything" -- pid 1 included, which
+    # on a test runner is the whole container. No mutation here may widen
+    # what tx_ours accepts.
+    mutant '    if tx_ours "$pid"; then
+        targets=$pid' '    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        targets=$pid' || return 1
     caught test_fleet.sh "a stale agent.pid is not trusted"
 }
 

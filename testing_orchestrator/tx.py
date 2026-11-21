@@ -184,9 +184,12 @@ AGENT_PROBE = r"""
 proc=${TX_PROC_ROOT:-/proc}
 have_proc=no
 [ -e "$proc/$$/cwd" ] && have_proc=yes
-# tx_ours PID: is PID a live tx agent working in $here?
+# tx_ours PID: is PID a live tx agent working in $here? Never 0, 1 or
+# this shell: a pid of 0 or 1 is a whole process group, or every process,
+# to `kill -<pid>`, and tx_scan puts every pid on the host to this test.
 tx_ours() {
-    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
+    [ "$1" = "$$" ] && return 1
     kill -0 "$1" 2>/dev/null || return 1
     if [ "$have_proc" = yes ]; then
         [ -n "$here" ] && [ "$proc/$1/cwd" -ef "$here" ] || return 1
@@ -1253,7 +1256,7 @@ here=""
 {probe}
 if [ -d "$d" ]; then
     status=not-running
-    here=$(cd "$d" 2>/dev/null && pwd -P)
+    here=$(CDPATH= cd -- "$d" 2>/dev/null && pwd -P)
     pid=""
     [ -f "$d/{pid}" ] && pid=$(cat "$d/{pid}" 2>/dev/null)
     targets=""
@@ -1294,6 +1297,7 @@ if [ -d "$d" ]; then
                 tx_kids "$p"
                 kill -KILL "$p" 2>/dev/null
                 for c in $tx_kids; do
+                    case "$c" in ''|*[!0-9]*|0|1) continue ;; esac
                     kill -KILL -"$c" 2>/dev/null || kill -KILL "$c" 2>/dev/null
                 done
             done
@@ -3280,7 +3284,7 @@ def cmd_doctor(args):
 py=$({py} -V 2>&1 || echo 'MISSING python3')
 bash=$(bash --version 2>/dev/null | head -1 || echo 'MISSING bash')
 d={rdir}
-here=$(cd "$d" 2>/dev/null && pwd -P)
+here=$(CDPATH= cd -- "$d" 2>/dev/null && pwd -P)
 {probe}
 running=no
 if [ -n "$here" ]; then
