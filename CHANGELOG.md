@@ -34,7 +34,8 @@ or export format changes.
   of the ssh user's. `tx start` refused to deploy over it ("already
   running"), `tx status` called the host alive, and `tx stop` ran
   `kill -TERM -<pid>` — that process's whole process group. Now such a pid
-  is "not running", and is never signalled.
+  is "not running", and is never signalled — nor is a pid of 0 or 1,
+  which to `kill -<pid>` mean this process group or every process.
 - **A lost `agent.pid` is traced by working directory**, read from `/proc`
   itself (no procps needed), rather than `pkill -TERM`ing every tx agent of
   the ssh user. On a host with no `/proc` (macOS), with `agent.pid` gone and
