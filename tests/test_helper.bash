@@ -27,7 +27,7 @@ setup_env() {
     mkdir -p "$FAKE_BIN" "$FAKE_ROOT"
     # Never let a stray environment leak into a test run.
     unset TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_JOBS TX_USER \
-          TX_PYTHON TX_SSH TX_SCP SSH_USER
+          TX_PYTHON TX_SSH TX_SCP SSH_USER TX_PROC_ROOT
 }
 
 teardown_env() {
@@ -264,6 +264,15 @@ FAILED_TESTS=()
 # about the tool instead of a list of python-ish identifiers.
 run_test() {
     local label="$1" name="$2"; shift 2
+    # TX_TEST_ONLY="label|label" runs just those -- how the mutation checks
+    # (test_mutations.sh) run one test against a copy of tx with a fix
+    # reverted, without the rest of its file.
+    if [ -n "${TX_TEST_ONLY:-}" ]; then
+        case "|$TX_TEST_ONLY|" in
+            *"|$label|"*) ;;
+            *) return 0 ;;
+        esac
+    fi
     TESTS_RUN=$((TESTS_RUN + 1))
     setup_env
     local rc=0 limit="${TX_TEST_TIMEOUT:-0}" timed_out=0
