@@ -90,15 +90,20 @@ agents to install, no packages, no root. Key-based SSH must already work
 | `tx status` | One line per host: `ARMED`, `RUNNING`, `TIDYING`, `DONE exit 0`, `TIMEOUT`. |
 | `tx collect` | Bring the results back into one directory, named by host. |
 | `tx summarize` | Who passed, who failed, who was slow — and how tight the start was. |
-| `tx clean` | Stop, then delete everything. No trace left — and it says so only if it could check. |
+| `tx clean` | Stop, then delete what tx put there — and nothing else: anything it did not put there stops it, by name. It says "no trace" only if it could check. |
 
 And more when you want them: `tx run` (all of the above in one shot, and
 `--batch N` to cover the fleet a few hosts at a time), `tx export` (the
 run as a floor-plan overlay — see [Draw it on the floor
 plan](#draw-it-on-the-floor-plan-tx-export)), `tx check` (will this plan
 work? no ssh needed), `tx doctor` (is the fleet ready?), `tx stop` (end
-the job, keep what it made), `tx logs` (collect the agents' own logs),
-and `tx hints` (goal → command).
+this run's job, keep what it made), `tx logs` (collect the agents' own
+logs), and `tx hints` (goal → command).
+
+`stop` and `clean` touch only **this run**: the agent working out of this
+`--remote-dir`, and the files tx put there. A second run on the same hosts
+out of another directory, or another user's, is left alone — see [What
+`tx clean` will and won't promise](#what-tx-clean-will-and-wont-promise).
 
 ---
 
@@ -576,18 +581,72 @@ quotes, newlines, `$(...)` and backslashes all survive.
 
 ### What `tx clean` will and won't promise
 
-It removes the working directory, then asks whether any agent outlived
-it. That question is `pgrep`, and on a host without procps a missing
-`pgrep` looks exactly like `pgrep` finding nothing — so rather than read
-that as a clean host, it says what it actually knows:
+**It deletes only what tx put there**, and refuses rather than delete
+anything else. Before 1.1.1 it ran `rm -rf` on whatever `--remote-dir`
+named; now it removes, by name:
+
+- tx's own files: the agent (`tx.py`), `payload.tar.gz`, `out/`, the run
+  record (`run.json`), `stdout`, `stderr`, `setup.log`, `teardown.log`,
+  `agent.log`, `agent.pid`, and `.tx-manifest`;
+- what the payload unpacked — the deploy writes each top-level name it
+  *creates* into `.tx-manifest` (a name already there is somebody else's,
+  and stays theirs);
+- what the run left beside them — whatever setup built, or a job wrote
+  next to itself rather than into `$TX_OUT` (`collect = *.csv`): the agent
+  notes what is new in the directory as the run ends, however it ends;
+
+and then `rmdir`s the directory. If anything else is in it — a file of
+somebody else's, a directory the payload was unpacked *into* but did not
+create, or the files of a directory deployed by tx 1.1.0 or earlier,
+which kept no record — that host is refused, the entries are named, and
+nothing on it is deleted:
 
 ```text
-[tx] the working directory is gone from every host. On 2 of them there is no
-     pgrep, so whether an agent outlived it is unknown: db07 db08
+  web01  REFUSED: tx did not put 1 thing(s) in /var/tmp/tx: 'notes.txt' -- nothing deleted; move them out or delete them, then tx clean again
+[tx] 1 host(s) left exactly as they were: tx deletes only what it put there, and says what else it found (above)
 ```
 
-`tx doctor` reports `pgrep=` per host, so you know before the run
-whether `stop` and `clean` will be able to verify themselves.
+A payload may not bring its own `.tx-manifest`: `tx start` refuses it,
+since the deploy keeps its record under that name.
+
+**It stops only this run's agent.** `tx stop`, `tx clean`, the stand-down
+after a failed start, `tx status`'s `ALIVE` and `tx doctor`'s
+`agent_running` all go by one test: a pid is this run's only if it is a
+live `tx.py agent` whose working directory (`/proc/PID/cwd`) is this
+`--remote-dir`. So a second run out of another `--remote-dir` on the same
+hosts keeps running, another user's agent is never touched, and an
+`agent.pid` naming a pid long since reused by something else — the default
+`/var/tmp/tx` survives a reboot — is not "already running" and is never
+signalled. With `agent.pid` gone, the agent is found by its working
+directory, read from `/proc` itself (no procps needed), never by name.
+
+**Without `/proc`** (macOS) there is no working directory to read, so tx
+goes by `agent.pid` and the agent's command line. If `agent.pid` is gone
+and a tx agent of yours is running, `stop` and `clean` fail on that host
+and say to kill it by hand — they never kill by name — and `clean` leaves
+the directory where it is.
+
+**It says "nothing of tx remains" only if it could check.** After the stop
+it asks whether an agent of this run outlived it. That question starts
+with `pgrep`, and on a host without procps a missing `pgrep` looks
+exactly like `pgrep` finding nothing — so rather than read that as a
+clean host, it says what it actually knows:
+
+```text
+[tx] the working directory is gone from every host. On 2 of them whether an agent
+     outlived it could not be checked (no pgrep, or no /proc to say whose an agent is): db07 db08
+```
+
+An agent still running out of the directory is a `LEFTOVER`: that host
+fails and nothing on it is deleted. Another run's agent is not one.
+
+`tx doctor` reports `pgrep=` and `proc=` per host, so you know before
+the run whether `clean` can rule out a stray agent and whether a lost
+`agent.pid` can be traced.
+
+`tx run --clean` (with `--batch` and `--muster` too) exits 1 when the
+clean failed on any host. In a sweep the next wave still runs, unless
+`--stop-on-fail` makes that wave the last.
 
 ## Exit status
 

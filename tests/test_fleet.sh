@@ -48,6 +48,72 @@ await_fleet() {
     return 1
 }
 
+# agent_pid HOST [DIR] -- what the run out of DIR (default $TX_REMOTE_DIR)
+# wrote as its agent's pid on HOST.
+agent_pid() {
+    cat "$FAKE_ROOT/$1${2:-$TX_REMOTE_DIR}/agent.pid" 2>/dev/null
+}
+
+# alive PID -- a live process, and not a zombie: a KILLed agent can sit
+# in state Z until it is reaped, and kill -0 still answers for it.
+alive() {
+    [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+    ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+}
+
+# await_done HOST DIR -- the run out of DIR on HOST has finished.
+await_done() {
+    local f="$FAKE_ROOT/$1$2/run.json" i=0
+    while [ "$i" -lt 100 ]; do
+        grep -q '"state": "done"' "$f" 2>/dev/null && return 0
+        sleep 0.2
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# start_stray_agent DIR -- a real agent, armed five minutes out, started
+# by hand out of DIR the way tx starts one (`python3 tx.py agent` from
+# inside it), but written in no pid file. Echoes its pid.
+start_stray_agent() {
+    local at run
+    at="$(python3 -c 'import time; print("%.3f" % (time.time() + 300))')"
+    run="$(printf 'sleep 1' | base64)"
+    (cd "$1" && exec python3 tx.py agent --host stray --at "$at" \
+        --run "$run" --timeout 30 < /dev/null > /dev/null 2>&1) &
+    echo $!
+}
+
+# Two runs on the same hosts, one out of $TX_REMOTE_DIR and one out of
+# $TX_REMOTE_DIR-b, each a job that takes a few seconds and then says it
+# finished. Sets $plan, and $a and $b to the two agents' pids on web01.
+#
+# The fake hosts share one kernel, so every agent of every "host" is
+# visible from every other: that is the very situation a real host is in
+# with two runs on it, and a test here passes only if tx tells them apart.
+two_runs() {
+    plan="$(plan_for --run 'sleep 5; echo done > "$TX_OUT/finished"' \
+            --timeout 60 -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC" "run A should start"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check \
+        --remote-dir "$TX_REMOTE_DIR-b"
+    assert_status 0 "$RUN_RC" "run B should start beside it"
+    a="$(agent_pid web01)"
+    b="$(agent_pid web01 "$TX_REMOTE_DIR-b")"
+    alive "$a" || fail "run A's agent should be running"
+    alive "$b" || fail "run B's agent should be running"
+}
+
+# B went on as though A had never been touched: its agent outlived A's
+# stop, and its job ran to the end.
+run_b_was_left_alone() {
+    alive "$b" || fail "stopping run A took run B's agent down too"
+    await_done web01 "$TX_REMOTE_DIR-b" || fail "run B never finished"
+    assert_file_exists "$FAKE_ROOT/web01$TX_REMOTE_DIR-b/out/finished" \
+        "run B's job should have run to the end"
+}
+
 # ---- deploy ----------------------------------------------------------------
 
 t_the_payload_lands_unpacked_on_every_host() {
@@ -98,18 +164,19 @@ t_a_job_with_no_payload_still_runs() {
 
 t_deploying_over_a_running_job_is_refused() {
     # Unpacking a new payload under a job that is still reading the old
-    # one is how a run produces results nobody can account for.
+    # one is how a run produces results nobody can account for. (A pid
+    # file naming some other live process is not a job running here: see
+    # "a stale agent.pid is not trusted".)
     install_fake_ssh
-    plan="$(fleet_with_job web01)"
-    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
-    mkdir -p "$d"
-    # A pid that is alive and is not going anywhere.
-    sleep 30 & echo $! > "$d/agent.pid"
-    holder=$!
+    plan="$(plan_for --run 'sleep 30' --timeout 60 -- web01)"
     run_tx start --plan "$plan" --start-in 1 --no-skew-check
-    kill "$holder" 2>/dev/null
+    assert_status 0 "$RUN_RC" "the first start should succeed"
+    pid="$(agent_pid web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
     assert_status 1 "$RUN_RC" "start should refuse to deploy over a live job"
     assert_contains "$RUN_OUT" "already running"
+    alive "$pid" || fail "the refused start took the running job down"
+    kill "$pid" 2>/dev/null
 }
 
 # ---- the synchronised start ------------------------------------------------
@@ -388,22 +455,39 @@ t_clean_says_so_plainly_when_it_could_check() {
     assert_not_contains "$RUN_OUT" "UNVERIFIED"
 }
 
+# pgrep_lists PID... -- a pgrep on the fake hosts that finds exactly
+# these agents, as a real one would on a host where they are running.
+# Spelled out rather than left to the image's own pgrep for the reason
+# fake_pgrep gives; clean puts each pid it names to its own test of
+# whose run the agent is.
+pgrep_lists() {
+    printf '#!/bin/sh\necho "%s"\nexit 0\n' "$*" > "$FAKE_BIN/pgrep"
+    chmod +x "$FAKE_BIN/pgrep"
+}
+
 t_clean_names_an_agent_that_outlived_it() {
-    # The third answer, and the one that must not be quiet: the directory
-    # went but something is still running. Untested until now, because the
-    # other two arrived at their answers through whatever pgrep the image
-    # happened to have, and neither could reach this one.
+    # The third answer, and the one that must not be quiet: an agent of
+    # *this* run still running out of the directory. The pid file names
+    # one agent; a second was started by hand out of the same directory,
+    # so stopping the first leaves it -- and clean must say so and delete
+    # nothing, rather than pull the directory out from under it.
     install_fake_ssh
-    fake_pgrep 0        # a host where an agent is still running
-    plan="$(fleet_with_job web01)"
+    plan="$(plan_for --run 'sleep 30' --timeout 60 -- web01)"
     run_tx start --plan "$plan" --start-in 1 --no-skew-check
-    await_fleet "$plan" 1 || fail "the job never finished"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    first="$(agent_pid web01)"
+    stray="$(start_stray_agent "$d")"
+    pgrep_lists "$first" "$stray"
     run_tx clean --plan "$plan" --yes
     assert_status 1 "$RUN_RC" "a fleet with an agent still on it is not clean"
     assert_contains "$RUN_OUT" "LEFTOVER"
     assert_contains "$RUN_OUT" "still running"
+    assert_contains "$RUN_OUT" "$stray"
     assert_not_contains "$RUN_OUT" "nothing of tx remains"
     assert_not_contains "$RUN_OUT" "UNVERIFIED"
+    assert_file_exists "$d/tx.py" "nothing should be deleted under a live agent"
+    alive "$first" && fail "the agent the pid file named should have been stopped"
+    kill "$stray" 2>/dev/null
 }
 
 t_doctor_says_whether_the_fleet_can_be_checked() {
@@ -412,6 +496,273 @@ t_doctor_says_whether_the_fleet_can_be_checked() {
     run_tx doctor --plan "$plan"
     assert_contains "$RUN_OUT" "pgrep=" \
         "doctor should say whether stop and clean can verify themselves"
+}
+
+# ---- only this run's agent -------------------------------------------------
+
+t_stopping_one_run_leaves_another_running() {
+    # The bug that started this: `tx stop` of one run waited on *any*
+    # `tx.py agent`, found the second run's, and after ten seconds
+    # pkill -KILLed it.
+    install_fake_ssh
+    two_runs
+    run_tx stop --plan "$plan"
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "stopped"
+    alive "$a" && fail "run A's agent should be gone"
+    run_b_was_left_alone
+    assert_no_file "$FAKE_ROOT/web01$TX_REMOTE_DIR/out/finished" \
+        "run A's job should not have finished"
+}
+
+t_cleaning_one_run_leaves_another_running() {
+    install_fake_ssh
+    two_runs
+    pgrep_lists "$a" "$b"      # a host with procps sees both
+    run_tx clean --plan "$plan" --yes
+    assert_status 0 "$RUN_RC"
+    assert_not_contains "$RUN_OUT" "LEFTOVER"
+    assert_no_file "$FAKE_ROOT/web01$TX_REMOTE_DIR" "run A should be cleaned"
+    alive "$a" && fail "run A's agent should be gone"
+    run_b_was_left_alone
+}
+
+t_a_lost_pid_file_still_finds_only_this_runs_agent() {
+    # With agent.pid gone the agent is found by its working directory,
+    # read from /proc -- never by name, which is both runs.
+    install_fake_ssh
+    two_runs
+    rm -f "$FAKE_ROOT/web01$TX_REMOTE_DIR/agent.pid"
+    run_tx stop --plan "$plan"
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "stopped"
+    alive "$a" && fail "run A's agent should have been found and stopped"
+    run_b_was_left_alone
+}
+
+t_clean_beside_another_run_is_clean() {
+    # Another run's agent on the host is not a LEFTOVER of this one.
+    install_fake_ssh
+    two_runs
+    await_done web01 "$TX_REMOTE_DIR" || fail "run A never finished"
+    pgrep_lists "$b"
+    run_tx clean --plan "$plan" --yes
+    assert_status 0 "$RUN_RC" "another run's agent is not this run's leftover"
+    assert_not_contains "$RUN_OUT" "LEFTOVER"
+    assert_contains "$RUN_OUT" "nothing of tx remains"
+    run_b_was_left_alone
+}
+
+t_doctor_reports_only_this_runs_agent() {
+    install_fake_ssh
+    two_runs
+    await_done web01 "$TX_REMOTE_DIR" || fail "run A never finished"
+    pgrep_lists "$b"
+    run_tx doctor --plan "$plan"
+    assert_contains "$RUN_OUT" "agent_running=no" \
+        "run B's agent is not run A's"
+    run_tx doctor --plan "$plan" --remote-dir "$TX_REMOTE_DIR-b"
+    assert_contains "$RUN_OUT" "agent_running=yes" \
+        "run B's own doctor should see its agent"
+    run_b_was_left_alone
+}
+
+t_a_stale_pid_file_is_not_trusted() {
+    # The default --remote-dir survives a reboot, so agent.pid can name a
+    # pid since reused by something else of the same user's. That is not a
+    # job running here: start must not refuse over it, status must not
+    # call it alive, and stop and clean must not signal it -- least of all
+    # its whole process group, which is what `kill -TERM -<pid>` was.
+    install_fake_ssh
+    fake_pgrep 1
+    plan="$(fleet_with_job web01)"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 1 || fail "the job never finished"
+
+    # A process group of somebody else's: a leader and a child in it.
+    python3 -c 'import os, subprocess, sys, time
+os.setpgid(0, 0)
+kid = subprocess.Popen(["sleep", "60"])
+open(sys.argv[1], "w").write("%d\n" % kid.pid)
+time.sleep(60)' "$TEST_TMPDIR/kid" &
+    leader=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$TEST_TMPDIR/kid" ] && break
+        sleep 0.2
+    done
+    kid="$(cat "$TEST_TMPDIR/kid")"
+    echo "$leader" > "$d/agent.pid"
+
+    rm -f "$d/run.json"
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "NOT-RUNNING" "a reused pid is not this run"
+    assert_not_contains "$RUN_OUT" "NOT-STARTED-YET"
+
+    run_tx stop --plan "$plan"
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "not-running"
+    alive "$leader" || fail "stop signalled a process that was never tx's"
+    alive "$kid" || fail "stop signalled the whole process group"
+
+    echo "$leader" > "$d/agent.pid"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC" "start should deploy over a stale pid file"
+    assert_not_contains "$RUN_OUT" "already running"
+    await_fleet "$plan" 1 || fail "the job never finished"
+
+    echo "$leader" > "$d/agent.pid"
+    run_tx clean --plan "$plan" --yes
+    assert_status 0 "$RUN_RC"
+    assert_no_file "$d" "clean should still remove the directory"
+    alive "$leader" || fail "clean signalled a process that was never tx's"
+    alive "$kid" || fail "clean signalled the whole process group"
+    kill -TERM -- "-$leader" 2>/dev/null
+}
+
+t_without_proc_a_lost_pid_file_is_refused() {
+    # macOS has no /proc, so with agent.pid gone nothing on the host can
+    # say which agent is this run's. Killing by name is how the wrong run
+    # died, so tx refuses, says to do it by hand, and touches nothing.
+    install_fake_ssh
+    export TX_PROC_ROOT="$TEST_TMPDIR/no-proc-here"
+    plan="$(plan_for --run 'sleep 30' --timeout 60 -- web01)"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC"
+    pid="$(agent_pid web01)"
+    rm -f "$d/agent.pid"
+    pgrep_lists "$pid"         # a host where a tx agent of yours runs
+
+    run_tx stop --plan "$plan"
+    assert_status 1 "$RUN_RC" "stop should fail on a host it cannot check"
+    assert_contains "$RUN_OUT" "kill it by hand"
+    alive "$pid" || fail "stop killed an agent it could not identify"
+
+    run_tx clean --plan "$plan" --yes
+    assert_status 1 "$RUN_RC" "clean should fail on a host it cannot check"
+    assert_contains "$RUN_OUT" "kill it by hand"
+    alive "$pid" || fail "clean killed an agent it could not identify"
+    assert_file_exists "$d/tx.py" "clean should leave the directory in place"
+    kill "$pid" 2>/dev/null
+}
+
+t_without_proc_the_pid_file_still_stops_the_job() {
+    # The other half: with agent.pid there, a host with no /proc stops
+    # its job as before.
+    install_fake_ssh
+    export TX_PROC_ROOT="$TEST_TMPDIR/no-proc-here"
+    plan="$(plan_for --run 'sleep 30' --timeout 60 -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    pid="$(agent_pid web01)"
+    run_tx stop --plan "$plan"
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "stopped"
+    sleep 0.5
+    alive "$pid" && fail "the agent the pid file names should be stopped"
+    return 0
+}
+
+# ---- clean deletes only what tx put there ---------------------------------
+
+t_clean_will_not_delete_a_strangers_file() {
+    # `rm -rf "$d"` deleted whatever --remote-dir named. A file tx did not
+    # put there stops the clean on that host, by name, with nothing gone.
+    install_fake_ssh
+    fake_pgrep 1
+    plan="$(fleet_with_job web01 web02)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 2 || fail "the fleet never finished"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    echo mine > "$d/notes.txt"
+    run_tx clean --plan "$plan" --yes
+    assert_status 1 "$RUN_RC" "a host clean refused is a failure"
+    assert_contains "$RUN_OUT" "REFUSED"
+    assert_contains "$RUN_OUT" "'notes.txt'"
+    assert_contains "$RUN_OUT" "nothing deleted"
+    assert_eq "mine" "$(cat "$d/notes.txt")" "the stranger's file must survive"
+    for f in tx.py bench.sh run.json stdout out/who; do
+        assert_file_exists "$d/$f" "nothing should be deleted on a refused host"
+    done
+    # The host without a stranger in it is cleaned all the same.
+    assert_no_file "$FAKE_ROOT/web02$TX_REMOTE_DIR" "web02 should be clean"
+}
+
+t_clean_takes_everything_the_run_made() {
+    # The other side of the record: what the payload unpacked, what setup
+    # built, and what the job wrote beside itself rather than in $TX_OUT
+    # (`collect = *.csv` is in the README) are all the run's, and go.
+    install_fake_ssh
+    fake_pgrep 1
+    mkdir -p bench/src
+    printf 'x\n' > bench/src/main.c
+    printf 'x\n' > bench/.hidden
+    cat > bench/bench.sh <<'SH'
+#!/bin/sh
+echo ok > results.csv
+mkdir -p scratch && echo x > scratch/tmp
+echo "$TX_HOST" > "$TX_OUT/who"
+SH
+    chmod +x bench/bench.sh
+    plan="$(plan_for --payload ./bench --setup 'echo obj > src/main.o; echo bin > built' \
+            --run ./bench.sh --timeout 30 -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 1 || fail "the job never finished"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    assert_file_exists "$d/results.csv" "the job should have written beside itself"
+    run_tx clean --plan "$plan" --yes
+    assert_status 0 "$RUN_RC"
+    assert_not_contains "$RUN_OUT" "REFUSED"
+    assert_no_file "$d" "everything the run made should be gone"
+}
+
+t_clean_will_not_take_a_directory_it_did_not_make() {
+    # A payload directory that was already there -- somebody's, under the
+    # same name -- is unpacked into, but stays theirs: clean names it.
+    install_fake_ssh
+    fake_pgrep 1
+    mkdir -p bench/data
+    printf 'x\n' > bench/data/input.txt
+    printf '#!/bin/sh\ntrue\n' > bench/bench.sh
+    chmod +x bench/bench.sh
+    plan="$(plan_for --payload ./bench --run ./bench.sh --timeout 30 -- web01)"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    mkdir -p "$d/data"
+    echo precious > "$d/data/precious.txt"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 1 || fail "the job never finished"
+    run_tx clean --plan "$plan" --yes
+    assert_status 1 "$RUN_RC"
+    assert_contains "$RUN_OUT" "'data'"
+    assert_eq "precious" "$(cat "$d/data/precious.txt")"
+}
+
+t_a_payload_may_not_bring_its_own_record() {
+    install_fake_ssh
+    mkdir -p bench
+    printf 'x\n' > bench/.tx-manifest
+    plan="$(plan_for --payload ./bench --run true --timeout 30 -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" ".tx-manifest"
+    assert_no_file "$FAKE_ROOT/web01$TX_REMOTE_DIR/tx.py" "nothing should travel"
+}
+
+t_a_run_whose_clean_fails_says_so() {
+    # `tx run --clean` used to drop clean's answer, so a host left as it
+    # was still exited 0.
+    install_fake_ssh
+    fake_pgrep 1
+    plan="$(fleet_with_job web01 web02)"
+    mkdir -p "$FAKE_ROOT/web02$TX_REMOTE_DIR"
+    echo mine > "$FAKE_ROOT/web02$TX_REMOTE_DIR/notes.txt"
+    run_tx run --plan "$plan" --start-in 1 --no-skew-check -d results \
+        --clean --quiet
+    assert_status 1 "$RUN_RC" "a clean that failed is worth an exit code"
+    assert_contains "$RUN_OUT" "REFUSED"
+    assert_file_exists "results/job~web02~out~who" "the run itself went fine"
+    assert_no_file "$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    assert_file_exists "$FAKE_ROOT/web02$TX_REMOTE_DIR/notes.txt"
 }
 
 t_a_dry_run_contacts_nothing() {
@@ -447,5 +798,18 @@ run_test "clean does not overclaim"            t_clean_does_not_claim_what_it_co
 run_test "clean says so when it could check"   t_clean_says_so_plainly_when_it_could_check
 run_test "clean names an agent left running"   t_clean_names_an_agent_that_outlived_it
 run_test "doctor reports pgrep"                t_doctor_says_whether_the_fleet_can_be_checked
+run_test "two runs: stop leaves the other"     t_stopping_one_run_leaves_another_running
+run_test "two runs: clean leaves the other"    t_cleaning_one_run_leaves_another_running
+run_test "two runs: lost pid file"             t_a_lost_pid_file_still_finds_only_this_runs_agent
+run_test "two runs: clean is clean"            t_clean_beside_another_run_is_clean
+run_test "two runs: doctor sees its own"       t_doctor_reports_only_this_runs_agent
+run_test "a stale agent.pid is not trusted"    t_a_stale_pid_file_is_not_trusted
+run_test "no /proc: lost pid file refused"     t_without_proc_a_lost_pid_file_is_refused
+run_test "no /proc: pid file still stops"      t_without_proc_the_pid_file_still_stops_the_job
+run_test "clean spares a stranger's file"      t_clean_will_not_delete_a_strangers_file
+run_test "clean takes what the run made"       t_clean_takes_everything_the_run_made
+run_test "clean spares a directory not made"   t_clean_will_not_take_a_directory_it_did_not_make
+run_test "a payload brings no record"          t_a_payload_may_not_bring_its_own_record
+run_test "run --clean that fails says so"      t_a_run_whose_clean_fails_says_so
 run_test "a dry run contacts nothing"          t_a_dry_run_contacts_nothing
 report_tests

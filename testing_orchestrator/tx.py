@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -134,17 +134,128 @@ FLAT_SEP = "~"
 
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 
-# The pgrep pattern is bracketed so the very shell running it is not
-# itself a match: that shell's command line contains the literal
-# "[t]x.py agent", which the regex "tx.py agent" does not match.
 # What a host says when it could not check whether an agent survived --
 # no pgrep there, and a missing pgrep is indistinguishable from "none
 # found". The difference matters: one is a clean host, the other is an
 # unanswered question.
 UNVERIFIED = "UNVERIFIED"
 
-PGREP = "pgrep -f '[t]x[.]py agent'"
-PKILL = "pkill -%s -f '[t]x[.]py agent'"
+# Every tx agent of the ssh user, as candidates only: pgrep cannot say
+# whose run an agent belongs to, so nothing is ever killed or reported on
+# this alone -- each pid it names is put to `tx_ours` (below) first. `-u`
+# because another user's agent is never this run's, and the pattern is
+# bracketed so the very shell running it is not itself a match: that
+# shell's command line contains the literal "[t]x.py agent", which the
+# regex "tx.py agent" does not match.
+PGREP_MINE = "pgrep -u \"$(id -u)\" -f '[t]x[.]py agent'"
+
+# The payload travels under this one name and is unpacked from it.
+PAYLOAD_NAME = "payload.tar.gz"
+
+# What tx put in the working directory besides its own fixed names: the
+# payload's top-level entries that the unpack created, and whatever the
+# run (setup, job, teardown) left beside them. `tx clean` deletes those
+# and nothing else, so the record is what stands between a mistyped
+# --remote-dir and somebody's files. One name per line; a name tx keeps
+# for itself, so a payload may not bring its own.
+MANIFEST_NAME = ".tx-manifest"
+
+# How a snippet on a host tells this run's agent from anybody else's.
+#
+# A pid alone is not enough. The default working directory survives a
+# reboot, so agent.pid can name a pid long since reused -- by a login
+# shell, a tmux server -- and `kill -TERM -<pid>` on that is a whole
+# process group that was never tx's. And "any `tx.py agent`" is not
+# enough either: a second run out of another --remote-dir is one too, and
+# so is another user's. The agent `cd`s into its working directory before
+# it starts and never leaves it, so the directory says whose it is: a pid
+# is this run's only if it is alive, is `tx.py agent`, and works in $here
+# (the remote dir, as `pwd -P` resolves it).
+#
+# Read from /proc itself, so it needs no procps. Without /proc (macOS)
+# there is no working directory to read: the pid file and the command
+# line (`ps`) are all there is, and a lost pid file is answered by
+# refusing rather than by killing anything by name (_kill_block).
+# TX_PROC_ROOT stands in a host with no /proc for the tests.
+#
+# Plain POSIX sh -- the ssh user's login shell runs it -- and no
+# `local`, so every helper's variables carry a tx_ prefix.
+AGENT_PROBE = r"""
+proc=${TX_PROC_ROOT:-/proc}
+have_proc=no
+[ -e "$proc/$$/cwd" ] && have_proc=yes
+# tx_ours PID: is PID a live tx agent working in $here? Never 0, 1 or
+# this shell: a pid of 0 or 1 is a whole process group, or every process,
+# to `kill -<pid>`, and tx_scan puts every pid on the host to this test.
+tx_ours() {
+    case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
+    [ "$1" = "$$" ] && return 1
+    kill -0 "$1" 2>/dev/null || return 1
+    if [ "$have_proc" = yes ]; then
+        [ -n "$here" ] && [ "$proc/$1/cwd" -ef "$here" ] || return 1
+        tx_cmd=$(tr '\000' ' ' < "$proc/$1/cmdline" 2>/dev/null)
+    elif command -v ps >/dev/null 2>&1; then
+        tx_cmd=$(ps -o args= -p "$1" 2>/dev/null)
+    else
+        # No /proc and no ps: the pid file is the only handle there is.
+        return 0
+    fi
+    case " $tx_cmd " in *" "@AGENT@" agent "*|*/@AGENT@" agent "*) return 0 ;; esac
+    return 1
+}
+# tx_scan: every agent working in $here, found by reading /proc -- for
+# when the pid file is gone or names somebody else.
+tx_scan() {
+    tx_found=""
+    for tx_p in "$proc"/[0-9]*; do
+        tx_p=${tx_p##*/}
+        tx_ours "$tx_p" && tx_found="$tx_found $tx_p"
+    done
+}
+# tx_kids PID: PID's children, read before PID is killed (after, they
+# belong to init and nothing says they were the agent's). Each is a job
+# phase, which the agent starts in a session of its own.
+tx_kids() {
+    tx_kids=""
+    if [ "$have_proc" = yes ]; then
+        tx_parent=$1
+        for tx_s in "$proc"/[0-9]*/stat; do
+            tx_line=""
+            read -r tx_line 2>/dev/null < "$tx_s" || continue
+            # The command name can hold spaces and parentheses, so the
+            # fields are counted from after its closing ") ".
+            set -- ${tx_line##*") "}
+            [ "${2:-}" = "$tx_parent" ] || continue
+            tx_c=${tx_s%/stat}
+            tx_kids="$tx_kids ${tx_c##*/}"
+        done
+    else
+        tx_kids=$(pgrep -P "$1" 2>/dev/null)
+    fi
+}
+"""
+
+
+def _agent_name():
+    """The agent's file name on the hosts: what `tx start` copies there,
+    and what its command line says it is running."""
+    return os.path.basename(_agent_source())
+
+
+def _probe():
+    """AGENT_PROBE, for this agent's name."""
+    return AGENT_PROBE.replace("@AGENT@", shlex.quote(_agent_name()))
+
+
+def _own_names():
+    """Everything tx itself writes in the working directory, by name.
+
+    These are tx's whatever the record says. Anything else there is tx's
+    only if the record (MANIFEST_NAME) names it.
+    """
+    return (_agent_name(), PAYLOAD_NAME, OUT_NAME, REPORT_NAME,
+            REPORT_NAME + ".tmp", STDOUT_NAME, STDERR_NAME, SETUP_LOG,
+            TEARDOWN_LOG, LOG_NAME, PID_NAME, MANIFEST_NAME)
 
 
 def _env(name, default):
@@ -736,6 +847,54 @@ def _forward_term(_signum, _frame):
     sys.exit(143)
 
 
+def _entries(workdir):
+    """The working directory's top-level names, as bytes: a name a job
+    made need not be text in any encoding, and it is compared and written
+    back exactly as the filesystem has it."""
+    try:
+        return set(os.listdir(os.fsencode(workdir)))
+    except OSError:
+        return set()
+
+
+def _note_created(workdir, before):
+    """Add what this run left in the working directory to the record.
+
+    `tx clean` deletes tx's own files and what the record names, and
+    refuses when anything else is there. A job's own files are tx's to
+    remove -- a build in setup, a `collect = *.csv` the job writes beside
+    itself -- but only the agent can tell them from a stranger's: it
+    knows what was there before it began. So what is new since then is
+    written down here, as the run ends, however it ends (finished, timed
+    out, or stopped by `tx stop`, whose SIGTERM unwinds through this).
+
+    A name with a newline in it cannot be one line of the record, so it
+    is left out and `clean` will name it rather than delete it.
+    """
+    try:
+        own = set(os.fsencode(n) for n in _own_names())
+        new = sorted(n for n in _entries(workdir) - before - own
+                     if b"\n" not in n)
+        if not new:
+            return
+        path = os.path.join(os.fsencode(workdir), os.fsencode(MANIFEST_NAME))
+        try:
+            with open(path, "rb") as fh:
+                had = fh.read()
+        except (IOError, OSError):
+            had = b""
+        known = set(had.split(b"\n"))
+        add = [n for n in new if n not in known]
+        if not add:
+            return
+        lead = b"\n" if had and not had.endswith(b"\n") else b""
+        with open(path, "ab") as fh:
+            fh.write(lead + b"".join(n + b"\n" for n in add))
+    except (IOError, OSError) as exc:
+        sys.stderr.write("tx agent: could not record what the run made "
+                         "(%s); tx clean will name it instead\n" % exc)
+
+
 def cmd_agent(args):
     """Run the job here, at the armed instant, and write down what happened.
 
@@ -746,6 +905,15 @@ def cmd_agent(args):
     signal.signal(signal.SIGTERM, _forward_term)
     signal.signal(signal.SIGINT, _forward_term)
     workdir = os.getcwd()
+    before = _entries(workdir)
+    try:
+        return _run_agent(args, workdir)
+    finally:
+        _note_created(workdir, before)
+
+
+def _run_agent(args, workdir):
+    """cmd_agent's work, inside the bracket that records what it made."""
     outdir = os.path.join(workdir, OUT_NAME)
     try:
         os.makedirs(outdir)
@@ -917,38 +1085,80 @@ def _pack_payload(payload):
     per file, which on a payload of a thousand small files is a thousand
     round trips, and it silently follows symlinks out of the tree.
     """
-    if not os.path.exists(payload):
-        die("payload not found: %s" % payload)
+    names = _payload_names(payload)
     fd, path = tempfile.mkstemp(prefix="tx-payload-", suffix=".tar.gz")
     os.close(fd)
     tf = tarfile.open(path, "w:gz")
     try:
         if os.path.isdir(payload):
-            for name in sorted(os.listdir(payload)):
+            for name in names:
                 tf.add(os.path.join(payload, name), arcname=name)
         else:
-            tf.add(payload, arcname=os.path.basename(payload))
+            tf.add(payload, arcname=names[0])
     finally:
         tf.close()
     return path
 
 
-def _deploy_script(rdir, has_payload):
-    # Single braces: this snippet is a *value* passed to the format call
-    # below, not a template itself, so doubling them would leave literal
-    # `{{` in the shell -- which bash reads as a command named `{{`,
+def _payload_names(payload):
+    """The top-level names the payload unpacks to on each host.
+
+    The deploy records the ones it creates, so `tx clean` knows them for
+    tx's. MANIFEST_NAME is where that record is kept, so a payload that
+    brings its own would overwrite it -- refused here, before anything
+    travels.
+    """
+    if not os.path.exists(payload):
+        die("payload not found: %s" % payload)
+    if os.path.isdir(payload):
+        names = sorted(os.listdir(payload))
+    else:
+        names = [os.path.basename(payload)]
+    if MANIFEST_NAME in names:
+        die("the payload has its own %s, a name tx keeps for its record of "
+            "what it put on each host; rename it" % MANIFEST_NAME)
+    return names
+
+
+def _deploy_script(rdir, names=None):
+    """Make the working directory ready for a run: refuse if this run's
+    agent is still going, clear the last run's outputs, record what the
+    payload is about to create, and unpack it.
+
+    `names` is the payload's top-level names (None: no payload). Each one
+    not already there is written into the record, because this unpack is
+    what makes it -- and only those: a name that was there before, and
+    that the record does not already hold, is somebody else's, and stays
+    theirs however the unpack changes it, so `tx clean` names it rather
+    than deleting it.
+    """
+    # The unpack is formatted once, on its own, and then passed as a
+    # *value* to the call below -- so its braces are doubled for its own
+    # format call and for no other. Doubling them again would leave a
+    # literal `{{` in the shell, which bash reads as a command named `{{`,
     # making the `exit 1` after it unconditional.
     unpack = ""
-    if has_payload:
-        unpack = """
-tar xzf payload.tar.gz || { echo 'payload would not unpack'; exit 1; }
-rm -f payload.tar.gz
-"""
+    if names is not None:
+        # A name with a newline cannot be a line of the record; it is
+        # left out, and `tx clean` names it rather than deleting it.
+        quoted = [shlex.quote(n) for n in names if "\n" not in n]
+        record = ""
+        if quoted:
+            record = """
+for n in %s; do
+    [ -e "$n" ] || [ -L "$n" ] || printf '%%s\\n' "$n" >> %s
+done""" % (" ".join(quoted), MANIFEST_NAME)
+        unpack = """{record}
+tar xzf {payload} || {{ echo 'payload would not unpack'; exit 1; }}
+rm -f {payload}
+""".format(record=record, payload=PAYLOAD_NAME)
     return """
 d={d}
 mkdir -p "$d" || {{ echo "cannot create $d"; exit 1; }}
 cd "$d" || exit 1
-if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+here=$(pwd -P)
+{probe}
+if [ -f {pid} ] && tx_ours "$(cat {pid} 2>/dev/null)"; then
     echo 'a job is already running here -- tx stop first'; exit 1
 fi
 rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log} {pid}
@@ -957,11 +1167,11 @@ echo deployed
 """.format(d=shlex.quote(rdir), pid=PID_NAME, out=OUT_NAME,
            report=REPORT_NAME, stdout=STDOUT_NAME, stderr=STDERR_NAME,
            setuplog=SETUP_LOG, teardownlog=TEARDOWN_LOG, log=LOG_NAME,
-           unpack=unpack)
+           unpack=unpack, probe=_probe())
 
 
 def _start_script(fleet, plan, args, host, at, index, run_id):
-    agent = os.path.basename(_agent_source())
+    agent = _agent_name()
     flags = [
         "agent",
         "--host", host,
@@ -992,7 +1202,9 @@ def _start_script(fleet, plan, args, host, at, index, run_id):
     return """
 d={d}
 cd "$d" 2>/dev/null || {{ echo 'not deployed (run tx start without --no-deploy)'; exit 1; }}
-if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+here=$(pwd -P)
+{probe}
+if [ -f {pid} ] && tx_ours "$(cat {pid} 2>/dev/null)"; then
     echo 'already running -- tx stop first'; exit 1
 fi
 {launch}
@@ -1013,49 +1225,97 @@ else
     exit 1
 fi
 """.format(d=shlex.quote(fleet.dir), pid=PID_NAME, launch=launch,
-           log=LOG_NAME, report=REPORT_NAME)
+           log=LOG_NAME, report=REPORT_NAME, probe=_probe())
 
 
 def _kill_block(rdir):
-    """Shell that stops the agent and leaves $status set. Falls through in
-    every case -- `clean` appends the removal to it, so it must never
-    exit early.
+    """Shell that stops this run's agent and leaves $status set. Falls
+    through in every case -- `clean` appends the removal to it, so it must
+    never exit early. $refused is set, and nothing is touched, when the
+    host cannot say which agent is this run's.
 
-    The pid file is the primary handle. Killing the agent's whole process
-    group is what actually stops the job: the agent is a python process
-    whose child is a shell whose children are the benchmark, and killing
-    only the first of those leaves the machine still working.
+    Only this run's agent: a pid is signalled, waited on and killed only
+    once `tx_ours` says it is a `tx.py agent` working in this --remote-dir
+    (AGENT_PROBE). The pid file is the primary handle; with it gone, or
+    naming somebody else, /proc is searched for an agent working here.
+    Never `pkill -f`: that is every run's agent on the host, and another
+    user's -- one `tx stop` used to take down a second run beside it.
+
+    The agent forwards the TERM to the job's whole process group, which is
+    what actually stops the job: the agent is a python process whose child
+    is a shell whose children are the benchmark, and killing only the
+    first of those leaves the machine still working. An agent that will
+    not go is KILLed, and so are its children's groups, read before it
+    dies.
     """
     return """
 d={d}
 status=not-deployed
+refused=""
+here=""
+{probe}
 if [ -d "$d" ]; then
     status=not-running
+    here=$(CDPATH= cd -- "$d" 2>/dev/null && pwd -P)
     pid=""
     [ -f "$d/{pid}" ] && pid=$(cat "$d/{pid}" 2>/dev/null)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-        kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-        status=stopped
-    elif {pgrep} >/dev/null 2>&1; then
-        {term} 2>/dev/null
-        status=stopped
+    targets=""
+    if tx_ours "$pid"; then
+        targets=$pid
+    elif [ "$have_proc" = yes ]; then
+        tx_scan
+        targets=$tx_found
+    elif [ ! -f "$d/{pid}" ]; then
+        # No pid file and no /proc: nothing here can say which agent is
+        # this run's, so nothing is killed. Only a host where an agent of
+        # this user is running (or might be) is refused; with none at
+        # all there is nothing to stop.
+        mine=$({pgrep} 2>/dev/null)
+        found=$?
+        if [ "$found" -eq 0 ]; then
+            refused="REFUSED: $d has no {pid} and this host has no /proc, so tx cannot tell whether a tx agent of yours (pid $(echo $mine)) is this run's -- nothing was stopped; kill it by hand"
+        elif [ "$found" -ne 1 ]; then
+            refused="REFUSED: $d has no {pid}, and this host has no /proc and no pgrep, so tx cannot tell whether this run's agent is still running -- nothing was stopped; check by hand"
+        fi
     fi
-    if [ "$status" = stopped ]; then
+    if [ -n "$targets" ]; then
+        for p in $targets; do
+            kill -TERM -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null
+        done
+        status=stopped
         i=0
-        while [ $i -lt 20 ]; do
-            {pgrep} >/dev/null 2>&1 || break
+        while :; do
+            left=""
+            for p in $targets; do tx_ours "$p" && left="$left $p"; done
+            [ -z "$left" ] && break
+            [ "$i" -ge 20 ] && break
             sleep 0.5
             i=$((i+1))
         done
-        if {pgrep} >/dev/null 2>&1; then
-            {kill9} 2>/dev/null
+        if [ -n "$left" ]; then
+            for p in $left; do
+                tx_kids "$p"
+                kill -KILL "$p" 2>/dev/null
+                for c in $tx_kids; do
+                    case "$c" in ''|*[!0-9]*|0|1) continue ;; esac
+                    kill -KILL -"$c" 2>/dev/null || kill -KILL "$c" 2>/dev/null
+                done
+            done
             status=killed
         fi
     fi
-    rm -f "$d/{pid}"
+    [ -n "$refused" ] || rm -f "$d/{pid}"
 fi
-""".format(d=shlex.quote(rdir), pid=PID_NAME, pgrep=PGREP,
-           term=PKILL % "TERM", kill9=PKILL % "KILL")
+""".format(d=shlex.quote(rdir), pid=PID_NAME, pgrep=PGREP_MINE,
+           probe=_probe())
+
+
+# What `stop` (and the stand-down after a failed arming) says after the
+# kill block: the host's status, or why it was left alone.
+STOP_TAIL = """
+if [ -n "$refused" ]; then echo "$refused"; exit 1; fi
+echo "$status"
+"""
 
 
 def _run_id():
@@ -1069,11 +1329,13 @@ def cmd_start(args, plan=None):
     if not args.no_deploy:
         tarball = None
         try:
+            names = None
             if plan.payload:
+                names = _payload_names(plan.payload)
                 tarball = _pack_payload(plan.payload)
                 log("[tx] payload %s -> %s packed"
                     % (plan.payload, fmt_bytes(os.path.getsize(tarball))))
-            script = _deploy_script(fleet.dir, bool(plan.payload))
+            script = _deploy_script(fleet.dir, names)
 
             def deploy(host):
                 rc, out = fleet.sh(host, "mkdir -p %s"
@@ -1086,7 +1348,7 @@ def cmd_start(args, plan=None):
                 if tarball:
                     # scp lands a file under its own basename, and the
                     # deploy script unpacks one fixed name.
-                    rc, out = fleet.push(host, [tarball], "payload.tar.gz")
+                    rc, out = fleet.push(host, [tarball], PAYLOAD_NAME)
                     if rc != 0:
                         return rc, "payload copy failed: %s" % out
                 return fleet.sh(host, script)
@@ -1120,7 +1382,7 @@ def cmd_start(args, plan=None):
         log("[tx] some hosts were not armed; the run would not be "
             "simultaneous, so it was not started on the rest either")
         fleet.each(lambda h: fleet.sh(h, _kill_block(fleet.dir)
-                                      + 'echo "$status"\n'),
+                                      + STOP_TAIL),
                    "standing the armed hosts back down", quiet=True)
         return 1
 
@@ -1170,12 +1432,16 @@ def _report_skew(fleet, args):
 # Status
 # ---------------------------------------------------------------------------
 
+# ALIVE is this run's agent only: a pid file naming a reused pid, or
+# another run's agent beside this one, is not this host still working.
 STATUS_SCRIPT_TMPL = """
 d={d}
 [ -d "$d" ] || {{ echo NOT-DEPLOYED; exit 0; }}
 cd "$d"
+here=$(pwd -P)
+{probe}
 alive=no
-if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+if [ -f {pid} ] && tx_ours "$(cat {pid} 2>/dev/null)"; then
     alive=yes
 fi
 if [ -f {report} ]; then
@@ -1189,7 +1455,7 @@ fi
 
 def _status_script(rdir):
     return STATUS_SCRIPT_TMPL.format(d=shlex.quote(rdir), pid=PID_NAME,
-                                     report=REPORT_NAME)
+                                     report=REPORT_NAME, probe=_probe())
 
 
 def _parse_status(text):
@@ -1837,7 +2103,7 @@ def render_summary(plan, states, args, waves=0):
 def cmd_stop(args, plan=None):
     plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
-    script = _kill_block(fleet.dir) + 'echo "$status"\n'
+    script = _kill_block(fleet.dir) + STOP_TAIL
     failed = fleet.each(lambda h: fleet.sh(h, script), "stopping the job")
     log("[tx] whatever the job produced is still on the hosts:")
     log("[tx]   tx collect     # bring it back")
@@ -1866,12 +2132,103 @@ def cmd_logs(args):
     return 1 if failed else 0
 
 
+# What `clean` runs after the kill block. In order, and each step stops
+# the host where it is with nothing deleted:
+#
+#   1. The kill block refused (no /proc, no pid file): tx cannot tell this
+#      run's agent from another's, so it leaves everything for a person.
+#   2. An agent of this run is still running out of the directory: the
+#      LEFTOVER. Another run's agent, or another user's, is not one --
+#      pgrep only lists candidates, and each is put to tx_ours.
+#   3. Anything in the directory that tx did not put there -- not one of
+#      its own names, not in the record (MANIFEST_NAME) -- is named, and
+#      the host is refused. This is what `rm -rf "$d"` used to delete,
+#      whatever --remote-dir happened to name.
+#
+# Only then are tx's own entries deleted, the record last, and the
+# directory itself `rmdir`ed -- which fails, rather than deletes, if
+# anything appeared in the meantime.
+CLEAN_TAIL = """
+if [ -n "$refused" ]; then echo "$refused"; exit 1; fi
+if [ -e "$d" ] && [ ! -d "$d" ]; then
+    echo "REFUSED: $d is not a directory, so not one tx made -- nothing deleted"
+    exit 1
+fi
+unsure=""
+if [ -d "$d" ]; then
+    mine=$({pgrep} 2>/dev/null)
+    found=$?
+    # Three answers out of one exit status, which is the distinction that
+    # was missing once: 0 means agents of yours are running (whose is
+    # asked next), 1 means none is, and anything else means there is no
+    # pgrep to ask -- and reading that as "none found" is how the run came
+    # to claim a clean fleet it never checked.
+    if [ "$found" -eq 0 ] && [ "$have_proc" = yes ]; then
+        left=""
+        for p in $mine; do tx_ours "$p" && left="$left $p"; done
+        if [ -n "$left" ]; then
+            echo "LEFTOVER: an agent is still running out of $d (pid$left) -- nothing deleted"
+            exit 1
+        fi
+    elif [ "$found" -eq 0 ]; then
+        unsure="no /proc here, so whether a tx agent of yours (pid $(echo $mine)) belonged to this run could not be ruled out"
+    elif [ "$found" -ne 1 ]; then
+        unsure="no pgrep here, so a stray agent could not be ruled out"
+    fi
+    (
+        cd "$d" || {{ echo "LEFTOVER: cannot enter $d"; exit 1; }}
+        nl='
+'
+        # tx_own NAME: did tx put NAME here?
+        tx_own() {{
+            case "$1" in
+                {own}) return 0 ;;
+                *"$nl"*) return 1 ;;
+            esac
+            [ -f {manifest} ] && LC_ALL=C grep -qxF -e "$1" {manifest} 2>/dev/null
+        }}
+        n=0
+        names=""
+        for e in * .[!.]* ..?*; do
+            [ -e "$e" ] || [ -L "$e" ] || continue
+            tx_own "$e" && continue
+            n=$((n+1))
+            [ "$n" -le 8 ] && names="$names '$e'"
+        done
+        if [ "$n" -gt 0 ]; then
+            [ "$n" -gt 8 ] && names="$names and $((n-8)) more"
+            echo "REFUSED: tx did not put $n thing(s) in $d:$names -- nothing deleted; move them out or delete them, then tx clean again"
+            exit 1
+        fi
+        for e in * .[!.]* ..?*; do
+            [ -e "$e" ] || [ -L "$e" ] || continue
+            [ "$e" = {manifest} ] && continue
+            tx_own "$e" && rm -rf -- "$e"
+        done
+        rm -f {manifest}
+    ) || exit 1
+    rmdir -- "$d" 2>/dev/null || {{ echo "LEFTOVER: $d still exists"; exit 1; }}
+fi
+if [ -n "$unsure" ]; then
+    echo "clean (was: $status) -- {mark}: $unsure"
+else
+    echo "clean (was: $status)"
+fi
+"""
+
+
+def _clean_script(rdir):
+    return _kill_block(rdir) + CLEAN_TAIL.format(
+        pgrep=PGREP_MINE, mark=UNVERIFIED, manifest=MANIFEST_NAME,
+        own="|".join(shlex.quote(n) for n in _own_names()))
+
+
 def cmd_clean(args, plan=None):
     plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
     if not args.yes and not args.dry_run:
-        log("[tx] this stops the job and deletes %s on %d hosts."
-            % (fleet.dir, len(plan.hosts)))
+        log("[tx] this stops the job and deletes what tx put in %s on %d "
+            "hosts." % (fleet.dir, len(plan.hosts)))
         log("[tx] collect anything you want first (tx collect, tx logs).")
         try:
             reply = input("[tx] type 'yes' to continue: ")
@@ -1880,36 +2237,26 @@ def cmd_clean(args, plan=None):
         if reply.strip().lower() != "yes":
             log("[tx] nothing done")
             return 1
-    # A host with no pgrep cannot be asked whether an agent survived, and
-    # a missing pgrep looks exactly like "no agents found" -- so it says
-    # so rather than letting the run claim a clean fleet it never checked.
-    script = _kill_block(fleet.dir) + """
-rm -rf "$d"
-if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
-{pgrep} >/dev/null 2>&1
-found=$?
-# Three answers out of one exit status, which is the distinction that
-# was missing: 0 means an agent is still there, 1 means none is, and 127
-# means there is no pgrep to ask -- and reading that last one as "none
-# found" is how the run came to claim a clean fleet it never checked.
-if [ "$found" -eq 0 ]; then
-    echo 'LEFTOVER: an agent is still running'; exit 1
-elif [ "$found" -eq 127 ]; then
-    echo "clean (was: $status) -- {mark}: no pgrep here, so a stray agent could not be ruled out"
-else
-    echo "clean (was: $status)"
-fi
-""".format(pgrep=PGREP, mark=UNVERIFIED)
+    script = _clean_script(fleet.dir)
     log("[tx] removing every trace on %d hosts" % len(plan.hosts))
     results = fleet.gather(lambda h: fleet.sh(h, script))
     failed = fleet.report(plan.hosts, results)
     if failed:
+        refused = [h for h in plan.hosts
+                   if (results[h][1] or "").startswith("REFUSED")]
+        if refused:
+            log("[tx] %d host(s) left exactly as they were: tx deletes only "
+                "what it put there, and says what else it found (above)"
+                % len(refused))
         return 1
+    # A host with no pgrep cannot be asked whether an agent survived, and
+    # a missing pgrep looks exactly like "no agents found" -- so it says
+    # so rather than letting the run claim a clean fleet it never checked.
     unsure = [h for h in plan.hosts if UNVERIFIED in (results[h][1] or "")]
     if unsure:
         log("[tx] the working directory is gone from every host. On %d of "
-            "them there is no pgrep, so whether an agent outlived it is "
-            "unknown: %s"
+            "them whether an agent outlived it could not be checked (no "
+            "pgrep, or no /proc to say whose an agent is): %s"
             % (len(unsure), " ".join(unsure[:8])))
         return 0
     log("[tx] nothing of tx remains on the fleet -- no packages, no services, "
@@ -1952,10 +2299,13 @@ def cmd_run(args):
             "collecting what there is")
     summary = cmd_summarize(args, plan)
     collected = cmd_collect(args, plan)
+    cleaned = 0
     if args.clean:
         args.yes = True
-        cmd_clean(args, plan)
-    return 1 if (summary or collected or not finished) else 0
+        # A clean that was refused, or found an agent still going, is a
+        # host left as it was -- worth an exit code, not a silent zero.
+        cleaned = cmd_clean(args, plan)
+    return 1 if (summary or collected or cleaned or not finished) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -2090,10 +2440,16 @@ def run_in_waves(args, plan):
 
         if cmd_collect(args, sub):
             trouble.append(n)
+        unclean = False
         if args.clean:
             args.yes = True
-            cmd_clean(args, sub)
-        if args.stop_on_fail and not finished:
+            # Counted, and the sweep goes on: the next wave is other
+            # hosts. Only --stop-on-fail makes a wave that could not be
+            # cleaned the last one.
+            unclean = bool(cmd_clean(args, sub))
+            if unclean:
+                trouble.append(n)
+        if args.stop_on_fail and (unclean or not finished):
             log("[tx] --stop-on-fail: not starting the remaining waves")
             break
 
@@ -2345,9 +2701,15 @@ def run_from_muster(args, plan):
                 trouble.append(wave)
             if cmd_collect(args, sub):
                 trouble.append(wave)
+            unclean = False
             if args.clean:
                 args.yes = True
-                cmd_clean(args, sub)
+                # Counted, and the sweep goes on unless --stop-on-fail:
+                # the items ran either way, and are checked in below by
+                # what ran, not by whether the host was tidied after.
+                unclean = bool(cmd_clean(args, sub))
+                if unclean:
+                    trouble.append(wave)
 
             # The check-in, and the whole judgement in this mode, in
             # three parts:
@@ -2383,7 +2745,7 @@ def run_from_muster(args, plan):
                     "rather than handing them out again" % len(working))
             if idle:
                 holding.append((head, idle))
-            if args.stop_on_fail and not finished:
+            if args.stop_on_fail and (unclean or not finished):
                 log("[tx] --stop-on-fail: not taking any more from the pool")
                 break
 
@@ -2914,16 +3276,31 @@ def cmd_doctor(args):
     log("  plan        %s: %d hosts, timeout %s"
         % (plan.path, len(plan.hosts), fmt_secs(plan.timeout)))
 
+    # agent_running is this --remote-dir's agent, by the same test stop and
+    # clean use: another run's agent on the host, or another user's, is
+    # not this run still going. proc= says whether a lost agent.pid can be
+    # traced -- without /proc, stop and clean refuse rather than guess.
     script = """
 py=$({py} -V 2>&1 || echo 'MISSING python3')
 bash=$(bash --version 2>/dev/null | head -1 || echo 'MISSING bash')
+d={rdir}
+here=$(CDPATH= cd -- "$d" 2>/dev/null && pwd -P)
+{probe}
 running=no
-{pgrep} >/dev/null 2>&1 && running=yes
-free=$(df -Pk {d} 2>/dev/null | awk 'NR==2{{print $4}}')
+if [ -n "$here" ]; then
+    if [ -f "$d/{pid}" ] && tx_ours "$(cat "$d/{pid}" 2>/dev/null)"; then
+        running=yes
+    elif [ "$have_proc" = yes ]; then
+        tx_scan
+        [ -n "$tx_found" ] && running=yes
+    fi
+fi
+free=$(df -Pk {parent} 2>/dev/null | awk 'NR==2{{print $4}}')
 [ -z "$free" ] && free=$(df -Pk / 2>/dev/null | awk 'NR==2{{print $4}}')
-echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); pgrep=$(command -v pgrep >/dev/null && echo yes || echo 'no (stop/clean cannot verify)'); agent_running=$running"
-""".format(py=shlex.quote(fleet.python), pgrep=PGREP,
-           d=shlex.quote(os.path.dirname(fleet.dir) or "/"))
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); pgrep=$(command -v pgrep >/dev/null && echo yes || echo 'no (clean cannot rule out a stray agent)'); proc=$([ "$have_proc" = yes ] && echo yes || echo 'no (a lost agent.pid cannot be traced)'); agent_running=$running"
+""".format(py=shlex.quote(fleet.python), rdir=shlex.quote(fleet.dir),
+           parent=shlex.quote(os.path.dirname(fleet.dir) or "/"),
+           pid=PID_NAME, probe=_probe())
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
                         "checking hosts (ssh, python, bash, tar, pgrep, disk)")
@@ -2983,8 +3360,9 @@ HINTS = [
     ("stop a run that is going wrong",
      "tx stop",
      "tx clean",
-     "stop kills the job and leaves what it produced; clean removes the "
-     "working directory and everything in it."),
+     "stop kills this run's job -- never another run's beside it -- and "
+     "leaves what it produced; clean removes what tx put on the hosts, and "
+     "names anything else it finds there rather than deleting it."),
     ("run something on hosts where nothing is installed",
      "tx gen --servers servers.txt --run 'uname -a; free -m'",
      "tx run",
@@ -3203,7 +3581,7 @@ def build_parser():
                     help="hosts to name in each finding (default: "
                          "%(default)s)")
 
-    sp = sub.add_parser("stop", help="stop the job, keep what it made")
+    sp = sub.add_parser("stop", help="stop this run's job, keep what it made")
     _add_fleet_flags(sp)
 
     lg = sub.add_parser("logs", help="collect the agents' own logs")
@@ -3211,7 +3589,7 @@ def build_parser():
     lg.add_argument("-d", "--dir", default="", metavar="DIR",
                     help="where they land (default: a tx-<timestamp>)")
 
-    cl = sub.add_parser("clean", help="stop, then delete every trace")
+    cl = sub.add_parser("clean", help="stop, then delete what tx put there")
     _add_fleet_flags(cl)
     cl.add_argument("--yes", action="store_true",
                     help="do not ask for confirmation")
@@ -3223,7 +3601,7 @@ def build_parser():
     r.add_argument("--top", type=int, default=10, metavar="N",
                    help=argparse.SUPPRESS)
     r.add_argument("--clean", action="store_true",
-                   help="also remove every trace once the results are back")
+                   help="also tx clean once the results are back")
     r.add_argument("-b", "--batch", type=int, default=None, metavar="N",
                    help="run N hosts at a time, in waves")
     r.add_argument("--resume", action="store_true",
