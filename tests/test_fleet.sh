@@ -93,14 +93,22 @@ start_stray_agent() {
 # The fake hosts share one kernel, so every agent of every "host" is
 # visible from every other: that is the very situation a real host is in
 # with two runs on it, and a test here passes only if tx tells them apart.
+#
+# Run B's job is held at its end, by a `hold` file in its directory, until
+# run_b_was_left_alone has seen B's agent alive and lets it go. Otherwise
+# B outlives A only by the time one `tx start` takes, and a test that
+# waits for A to finish and then runs doctor or clean can see B finish on
+# its own first -- and report it killed (TX-003, a race on slow runners).
 two_runs() {
-    plan="$(plan_for --run 'sleep 5; echo done > "$TX_OUT/finished"' \
-            --timeout 60 -- web01)"
+    plan="$(plan_for \
+        --run 'sleep 5; while [ -e hold ]; do sleep 0.2; done; echo done > "$TX_OUT/finished"' \
+        --timeout 60 -- web01)"
     run_tx start --plan "$plan" --start-in 1 --no-skew-check
     assert_status 0 "$RUN_RC" "run A should start"
     run_tx start --plan "$plan" --start-in 1 --no-skew-check \
         --remote-dir "$TX_REMOTE_DIR-b"
     assert_status 0 "$RUN_RC" "run B should start beside it"
+    touch "$FAKE_ROOT/web01$TX_REMOTE_DIR-b/hold"
     a="$(agent_pid web01)"
     b="$(agent_pid web01 "$TX_REMOTE_DIR-b")"
     alive "$a" || fail "run A's agent should be running"
@@ -108,9 +116,10 @@ two_runs() {
 }
 
 # B went on as though A had never been touched: its agent outlived A's
-# stop, and its job ran to the end.
+# stop, and its job, let go, ran to the end.
 run_b_was_left_alone() {
     alive "$b" || fail "stopping run A took run B's agent down too"
+    rm -f "$FAKE_ROOT/web01$TX_REMOTE_DIR-b/hold"
     await_done web01 "$TX_REMOTE_DIR-b" || fail "run B never finished"
     assert_file_exists "$FAKE_ROOT/web01$TX_REMOTE_DIR-b/out/finished" \
         "run B's job should have run to the end"

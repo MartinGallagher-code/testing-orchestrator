@@ -252,6 +252,139 @@ t_the_record_is_readable_all_the_way_through() {
     assert_contains "$(cat "$rec")" '"state": "running"'
 }
 
+# ---- the agent and the payload ----------------------------------------------
+
+# The agent is started in the directory the payload unpacks into, and a
+# plain `python3 tx.py` puts the script's own directory first on
+# sys.path -- so every top-level .py the job shipped would shadow the
+# stdlib module of that name *in the agent*. These are modules tx.py
+# imports (queue by way of concurrent.futures), each fatal on import, so
+# an agent that loads one dies before it writes a record.
+SHADOWED="json queue signal subprocess"
+
+# shadowing_payload -- ./bench with those modules at its top level, a
+# helper of the job's own beside them, and bench.py, which imports the
+# helper (and the module named in its first argument, if any) and writes
+# down what it found and where it ran.
+shadowing_payload() {
+    mkdir -p bench
+    local m
+    for m in $SHADOWED; do
+        printf 'raise SystemExit("shadowed: the payload'\''s %s.py was imported")\n' \
+            "$m" > "bench/$m.py"
+    done
+    printf 'WHO = "the payload'\''s own helper"\n' > bench/helper.py
+    cat > bench/bench.py <<'PY'
+import os
+import sys
+
+import helper
+
+out = os.environ["TX_OUT"]
+with open(os.path.join(out, "helper"), "w") as fh:
+    fh.write(helper.WHO + "\n")
+with open(os.path.join(out, "cwd"), "w") as fh:
+    fh.write(os.getcwd() + "\n")
+with open(os.path.join(out, "host"), "w") as fh:
+    fh.write(os.environ["TX_HOST"] + "\n")
+if len(sys.argv) > 1:
+    __import__(sys.argv[1])
+    with open(os.path.join(out, "pythonpath"), "w") as fh:
+        fh.write(os.environ.get("PYTHONPATH", "") + "\n")
+PY
+}
+
+# await_done N -- until N hosts have a record that says done, or give up.
+await_done() {
+    local n="$1" i=0
+    while [ "$i" -lt 150 ]; do
+        if [ "$(find "$FAKE_ROOT" -name run.json -exec grep -l '"state": "done"' {} + 2>/dev/null | wc -l)" -ge "$n" ]; then
+            return 0
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+    return 1
+}
+
+t_the_agent_never_imports_the_payloads_modules() {
+    # A benchmark with its own json.py or queue.py is ordinary; a fleet
+    # run that dies on every host because of it, reporting only that "the
+    # agent died on startup", is not. The job still runs in the payload
+    # directory and still finds its own helper there.
+    install_fake_ssh
+    shadowing_payload
+    plan="$(plan_for --payload ./bench --run 'python3 bench.py' --tag sh \
+            --timeout 30 -- web01 web02 web03)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC" "start should arm every host"
+    assert_not_contains "$RUN_OUT" "died on startup"
+    await_done 3 || fail "the job did not finish on every host"
+    local h d
+    for h in web01 web02 web03; do
+        d="$FAKE_ROOT/$h$TX_REMOTE_DIR"
+        REC="$d/run.json"
+        assert_eq "done" "$(field state)" "the record on $h"
+        assert_eq "0" "$(field exit)" "the job's exit status on $h"
+        assert_eq "$h" "$(field host)" "the record names its host"
+        assert_eq "$(python3 "$TX" --version | sed -n '1s/.* //p')" \
+                  "$(field agent_version)" "the record carries the agent's version"
+        assert_not_contains "$(cat "$d/agent.log" 2>/dev/null)" "shadowed"
+        assert_eq "the payload's own helper" "$(cat "$d/out/helper")" \
+            "the job should still import its own helper from the payload"
+        assert_eq "$(cd "$d" && pwd -P)" "$(cat "$d/out/cwd")" \
+            "the job should still run in the payload directory"
+        assert_eq "$h" "$(cat "$d/out/host")"
+    done
+}
+
+t_the_job_keeps_the_pythonpath_it_was_given() {
+    # The agent's own interpreter ignores PYTHON* variables; the job is
+    # not the agent, and inherits its environment exactly as before.
+    install_fake_ssh
+    shadowing_payload
+    mkdir -p site
+    printf 'X = 1\n' > site/from_pythonpath.py
+    export PYTHONPATH="$TEST_TMPDIR/site"
+    plan="$(plan_for --payload ./bench --run 'python3 bench.py from_pythonpath' \
+            --timeout 30 -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC"
+    await_done 1 || fail "the job never finished"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    REC="$d/run.json"
+    assert_eq "0" "$(field exit)" "the job should import a module from \$PYTHONPATH"
+    assert_eq "$TEST_TMPDIR/site" "$(cat "$d/out/pythonpath")"
+}
+
+t_without_the_isolation_the_payload_kills_the_agent() {
+    # The mutation: the same run from a copy of tx.py whose launch line
+    # has lost -I. If this passes, the test above proves nothing.
+    install_fake_ssh
+    shadowing_payload
+    mkdir -p mutant
+    sed 's/nohup %s -I %s %s/nohup %s %s %s/' "$TX" > mutant/tx.py
+    if cmp -s "$TX" mutant/tx.py; then
+        fail "the mutation no longer applies to tx.py's launch line"
+        return 1
+    fi
+    TX="$TEST_TMPDIR/mutant/tx.py"
+    plan="$(plan_for --payload ./bench --run 'python3 bench.py' --timeout 30 \
+            -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    local i=0
+    while [ "$i" -lt 50 ]; do
+        grep -q shadowed "$d/agent.log" 2>/dev/null && break
+        sleep 0.2
+        i=$((i + 1))
+    done
+    assert_contains "$(cat "$d/agent.log" 2>/dev/null)" "shadowed: the payload's" \
+        "without -I the agent should have imported the payload's module"
+    sleep 1.5
+    assert_no_file "$d/run.json" "a shadowed agent should never have written a record"
+}
+
 echo "agent"
 run_test "the job knows where it is"           t_the_job_knows_where_it_is_and_where_to_write
 run_test "the fleet list is opt-in"            t_the_whole_fleet_is_offered_but_not_forced
@@ -272,4 +405,7 @@ run_test "a failed teardown is said"           t_a_teardown_that_failed_is_said_
 run_test "an overrunning job is killed"        t_a_job_that_overruns_is_killed_and_marked
 run_test "a timeout takes the whole tree"      t_a_timeout_takes_the_whole_tree_with_it
 run_test "the record is readable throughout"   t_the_record_is_readable_all_the_way_through
+run_test "the payload cannot shadow the agent" t_the_agent_never_imports_the_payloads_modules
+run_test "the job keeps its PYTHONPATH"        t_the_job_keeps_the_pythonpath_it_was_given
+run_test "mutation: no -I, a dead agent"       t_without_the_isolation_the_payload_kills_the_agent
 report_tests
