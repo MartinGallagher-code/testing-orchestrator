@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -256,6 +256,66 @@ def _own_names():
     return (_agent_name(), PAYLOAD_NAME, OUT_NAME, REPORT_NAME,
             REPORT_NAME + ".tmp", STDOUT_NAME, STDERR_NAME, SETUP_LOG,
             TEARDOWN_LOG, LOG_NAME, PID_NAME, MANIFEST_NAME)
+
+# The guard on --remote-dir (TX-002, as mx 1.12.0's MX-006). The default
+# /var/tmp/tx sits in a world-writable directory, so any user on a host can
+# make it first. Whoever owns it, or can write to it, can swap tx.py or the
+# payload between the copy and the launch (separate ssh round trips) and so
+# run their code as the ssh user, plant an agent.pid for `tx stop` to
+# signal, or leave a symlink where scp writes. So before tx writes to it,
+# runs from it, signals what its pid file names, reads from it or deletes
+# it, each host checks that it is:
+#   * a real directory -- not a symlink (a trailing slash is dropped first,
+#     so `link/` is the link), not a file;
+#   * owned by the ssh user (`id -u` there);
+#   * writable by nobody else: no group-write, no other-write bit.
+#     --allow-shared-remote-dir (TX_ALLOW_SHARED_REMOTE_DIR=1) lifts the
+#     group-write rule only, for a directory a group shares on purpose; the
+#     symlink, owner and other-write rules always hold.
+# `ls -ldn` rather than stat, whose flags differ between GNU and BSD.
+# Missing is not refused here: start makes it (mkdir -m 700), and stop,
+# clean and status report it as never deployed, as they always did.
+# A plain function, not a format template: it is put in front of snippets
+# whose own braces are already formatted.
+DIR_CHECK_FN = """
+_tx_dir_check() {
+    _tx_bad=""
+    if [ -L "$1" ] || { [ -e "$1" ] && [ ! -d "$1" ]; }; then
+        _tx_bad="$1 is a symlink or not a directory ($(ls -ld -- "$1" 2>/dev/null | cut -c1-10))"
+        return 1
+    fi
+    [ -d "$1" ] || return 0
+    _tx_dm=$(ls -ldn -- "$1" | awk 'NR==1 {print $1}')
+    _tx_du=$(ls -ldn -- "$1" | awk 'NR==1 {print $3}')
+    _tx_dn=$(ls -ld -- "$1" | awk 'NR==1 {print $3}')
+    _tx_id=$(id -u)
+    _tx_why=""
+    [ "$_tx_du" = "$_tx_id" ] || _tx_why="it is not owned by the ssh user"
+    case "$_tx_dm" in
+        ????????w*) _tx_why="${_tx_why:+$_tx_why; }others can write to it" ;;
+    esac
+    if [ "$_tx_shared" != 1 ]; then
+        case "$_tx_dm" in
+            ?????w*) _tx_why="${_tx_why:+$_tx_why; }its group can write to it" ;;
+        esac
+    fi
+    [ -n "$_tx_why" ] || return 0
+    _tx_bad="$1 is owned by $_tx_dn (uid $_tx_du), mode $_tx_dm; the ssh user is uid $_tx_id: $_tx_why"
+    return 1
+}
+"""
+
+REFUSED_HOW = ("tx will not deploy to it, run from it, stop what it names, "
+               "collect from it or clean it: remove it, chmod go-w it, or "
+               "pick another --remote-dir (a group-shared one needs "
+               "--allow-shared-remote-dir)")
+
+# Where a deploy copies to: a directory of tx's own inside --remote-dir,
+# made private, whose contents are then renamed over the real names. scp
+# follows a symlink at the name it writes to, so a symlink planted at tx.py
+# (possible in a group-shared directory) would have it overwrite the file
+# the link points to; rm -f then mv replaces the link instead.
+STAGE_PREFIX = ".tx-incoming."
 
 
 def _env(name, default):
@@ -558,6 +618,9 @@ class Fleet(object):
         self.ssh = (args.ssh or "ssh").split()
         self.scp = (args.scp or "scp").split()
         self.dry_run = getattr(args, "dry_run", False)
+        # --allow-shared-remote-dir: a group-writable --remote-dir is let
+        # through (TX-002); every other check of `_dir_guard` still holds.
+        self.shared = bool(getattr(args, "allow_shared_remote_dir", False))
 
     def target(self, host):
         addr = self.plan.addrs[host]
@@ -1120,10 +1183,51 @@ def _payload_names(payload):
     return names
 
 
-def _deploy_script(rdir, names=None):
-    """Make the working directory ready for a run: refuse if this run's
-    agent is still going, clear the last run's outputs, record what the
-    payload is about to create, and unpack it.
+def _dir_path(rdir):
+    """--remote-dir with any trailing slash dropped: `link/` names the
+    directory a symlink points to, and it is the link that is checked."""
+    return rdir.rstrip("/") or rdir
+
+
+def _dir_guard(fleet, create=False, to_stderr=False):
+    """Shell that refuses this host's --remote-dir unless it is safe to use
+    (`DIR_CHECK_FN`), printing one REFUSED line naming the directory, its
+    owner, its mode and the ssh user's uid, and exiting 1 so nothing after
+    it runs. With `create`, a directory that does not exist yet is made
+    first, mode 700 (any missing parents get the login shell's umask).
+    `to_stderr` is for a snippet whose stdout is data -- collect's tar."""
+    d = shlex.quote(_dir_path(fleet.dir))
+    s = DIR_CHECK_FN + "_tx_shared=%s\n" % ("1" if fleet.shared else "0")
+    out = " >&2" if to_stderr else ""
+    if create:
+        s += ("if [ ! -e %s ] && [ ! -L %s ]; then\n"
+              "    mkdir -p -m 700 -- %s || { echo 'could not create "
+              "--remote-dir' %s%s; exit 1; }\n"
+              "fi\n" % (d, d, d, d, out))
+    s += ("_tx_dir_check %s || { echo \"REFUSED: --remote-dir $_tx_bad. "
+          "%s\"%s; exit 1; }\n" % (d, REFUSED_HOW, out))
+    return s
+
+
+def _refused(text):
+    """The REFUSED line out of a host's reply, or "" if it is not one."""
+    for line in (text or "").splitlines():
+        if line.startswith("REFUSED: "):
+            return line
+    return ""
+
+
+def _stage_name():
+    """A staging directory name no other deploy will pick."""
+    return STAGE_PREFIX + "%d.%s" % (os.getpid(), os.urandom(4).hex())
+
+
+def _deploy_script(rdir, stage, agent, names=None):
+    """The second half of a deploy, once the files are in `stage`: refuse
+    a directory this run's agent is still running in, clear the last run's
+    outputs, rename the agent over its real name, record what the payload
+    is about to create, and unpack it straight out of the stage.
+    `_dir_guard` goes in front of it.
 
     `names` is the payload's top-level names (None: no payload). Each one
     not already there is written into the record, because this unpack is
@@ -1149,25 +1253,73 @@ for n in %s; do
     [ -e "$n" ] || [ -L "$n" ] || printf '%%s\\n' "$n" >> %s
 done""" % (" ".join(quoted), MANIFEST_NAME)
         unpack = """{record}
-tar xzf {payload} || {{ echo 'payload would not unpack'; exit 1; }}
-rm -f {payload}
+tar xzf "$s"/{payload} || {{ rm -rf -- "$s"; echo 'payload would not unpack'; exit 1; }}
 """.format(record=record, payload=PAYLOAD_NAME)
     return """
 d={d}
-mkdir -p "$d" || {{ echo "cannot create $d"; exit 1; }}
+s={stage}
 cd "$d" || exit 1
 here=$(pwd -P)
 {probe}
 if [ -f {pid} ] && tx_ours "$(cat {pid} 2>/dev/null)"; then
+    rm -rf -- "$s"
     echo 'a job is already running here -- tx stop first'; exit 1
 fi
-rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log} {pid}
+# payload.tar.gz too: an older tx unpacked from that fixed name, and one
+# cut short could have left it (or a symlink at it) behind.
+rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log} {pid} {payload}
+# Whatever stands at the agent's name goes first, then the staged copy is
+# renamed onto it: a symlink there is replaced, never written through, and
+# a directory there makes the rm fail rather than the mv move into it.
+rm -f -- {agent} && mv -f -- "$s"/{agent} {agent} || {{
+    rm -rf -- "$s"; echo 'could not put the agent in place'; exit 1; }}
 {unpack}
+rm -rf -- "$s"
 echo deployed
-""".format(d=shlex.quote(rdir), pid=PID_NAME, out=OUT_NAME,
+""".format(d=shlex.quote(_dir_path(rdir)), stage=shlex.quote(stage),
+           agent=shlex.quote(agent), pid=PID_NAME, out=OUT_NAME,
            report=REPORT_NAME, stdout=STDOUT_NAME, stderr=STDERR_NAME,
            setuplog=SETUP_LOG, teardownlog=TEARDOWN_LOG, log=LOG_NAME,
-           unpack=unpack, probe=_probe())
+           unpack=unpack, probe=_probe(), payload=PAYLOAD_NAME)
+
+
+def _deploy(fleet, host, tarball, names=None):
+    """Copy the agent (and the packed payload) to one host, through a
+    private staging directory, and unpack it. Returns (rc, text).
+    `names` is the payload's top-level names, for the record
+    (`_deploy_script`); None when there is no payload.
+
+    Three round trips, each checking --remote-dir first: make and check
+    the directory and make the stage; scp into the stage (scp writes
+    before any shell runs, so it cannot check anything itself); then
+    check again and rename into place."""
+    stage = _stage_name()
+    agent = _agent_name()
+    d = shlex.quote(_dir_path(fleet.dir))
+    rc, out = fleet.sh(host, _dir_guard(fleet, create=True)
+                       + "cd %s && mkdir -m 700 -- %s\n" % (d, stage))
+    if rc != 0:
+        return rc, out if _refused(out) else "mkdir failed: %s" % out
+
+    def drop_stage():
+        fleet.sh(host, _dir_guard(fleet) + "cd %s && rm -rf -- %s\n"
+                 % (d, stage))
+
+    rc, out = fleet.push(host, [_agent_source()], stage + "/")
+    if rc != 0:
+        drop_stage()
+        return rc, "copy failed: %s" % out
+    if tarball:
+        # scp lands a file under its own basename, and the deploy script
+        # unpacks one fixed name.
+        rc, out = fleet.push(host, [tarball], stage + "/" + PAYLOAD_NAME)
+        if rc != 0:
+            drop_stage()
+            return rc, "payload copy failed: %s" % out
+    # A refusal here means the directory changed under the copy, and it is
+    # not tx's to tidy any more: the stage is left where it is.
+    return fleet.sh(host, _dir_guard(fleet)
+                    + _deploy_script(fleet.dir, stage, agent, names))
 
 
 def _start_script(fleet, plan, args, host, at, index, run_id):
@@ -1199,7 +1351,11 @@ def _start_script(fleet, plan, args, host, at, index, run_id):
     launch = ("nohup %s %s %s < /dev/null >> %s 2>&1 &"
               % (shlex.quote(fleet.python), shlex.quote(agent),
                  " ".join(shlex.quote(f) for f in flags), LOG_NAME))
-    return """
+    # The directory is checked again first, in this same ssh: what runs is
+    # what is in it now, not what the deploy saw a round trip ago. The pid
+    # file is written to a private name and renamed into place, so a
+    # symlink at agent.pid is replaced, never written through.
+    return _dir_guard(fleet) + """
 d={d}
 cd "$d" 2>/dev/null || {{ echo 'not deployed (run tx start without --no-deploy)'; exit 1; }}
 here=$(pwd -P)
@@ -1209,7 +1365,9 @@ if [ -f {pid} ] && tx_ours "$(cat {pid} 2>/dev/null)"; then
 fi
 {launch}
 agent_pid=$!
-echo "$agent_pid" > {pid}
+t={stage}pid.$$
+rm -f -- "$t" {pid}
+echo "$agent_pid" > "$t" && mv -f -- "$t" {pid}
 sleep 0.3
 if kill -0 "$agent_pid" 2>/dev/null; then
     echo armed
@@ -1224,8 +1382,9 @@ else
     rm -f {pid}
     exit 1
 fi
-""".format(d=shlex.quote(fleet.dir), pid=PID_NAME, launch=launch,
-           log=LOG_NAME, report=REPORT_NAME, probe=_probe())
+""".format(d=shlex.quote(_dir_path(fleet.dir)), pid=PID_NAME, launch=launch,
+           log=LOG_NAME, report=REPORT_NAME, stage=STAGE_PREFIX,
+           probe=_probe())
 
 
 def _kill_block(rdir):
@@ -1306,7 +1465,7 @@ if [ -d "$d" ]; then
     fi
     [ -n "$refused" ] || rm -f "$d/{pid}"
 fi
-""".format(d=shlex.quote(rdir), pid=PID_NAME, pgrep=PGREP_MINE,
+""".format(d=shlex.quote(_dir_path(rdir)), pid=PID_NAME, pgrep=PGREP_MINE,
            probe=_probe())
 
 
@@ -1335,23 +1494,8 @@ def cmd_start(args, plan=None):
                 tarball = _pack_payload(plan.payload)
                 log("[tx] payload %s -> %s packed"
                     % (plan.payload, fmt_bytes(os.path.getsize(tarball))))
-            script = _deploy_script(fleet.dir, names)
-
             def deploy(host):
-                rc, out = fleet.sh(host, "mkdir -p %s"
-                                   % shlex.quote(fleet.dir))
-                if rc != 0:
-                    return rc, "mkdir failed: %s" % out
-                rc, out = fleet.push(host, [_agent_source()])
-                if rc != 0:
-                    return rc, "copy failed: %s" % out
-                if tarball:
-                    # scp lands a file under its own basename, and the
-                    # deploy script unpacks one fixed name.
-                    rc, out = fleet.push(host, [tarball], PAYLOAD_NAME)
-                    if rc != 0:
-                        return rc, "payload copy failed: %s" % out
-                return fleet.sh(host, script)
+                return _deploy(fleet, host, tarball, names)
 
             if fleet.each(deploy, "deploying the job", quiet=True):
                 return 1
@@ -1381,7 +1525,10 @@ def cmd_start(args, plan=None):
     if failed:
         log("[tx] some hosts were not armed; the run would not be "
             "simultaneous, so it was not started on the rest either")
-        fleet.each(lambda h: fleet.sh(h, _kill_block(fleet.dir)
+        # Guarded like `tx stop`: a host refused at arming has nothing of
+        # this run's to stand down, and its pid file is not to be trusted.
+        fleet.each(lambda h: fleet.sh(h, _dir_guard(fleet)
+                                      + _kill_block(fleet.dir)
                                       + STOP_TAIL),
                    "standing the armed hosts back down", quiet=True)
         return 1
@@ -1454,8 +1601,9 @@ fi
 
 
 def _status_script(rdir):
-    return STATUS_SCRIPT_TMPL.format(d=shlex.quote(rdir), pid=PID_NAME,
-                                     report=REPORT_NAME, probe=_probe())
+    return STATUS_SCRIPT_TMPL.format(d=shlex.quote(_dir_path(rdir)),
+                                     pid=PID_NAME, report=REPORT_NAME,
+                                     probe=_probe())
 
 
 def _parse_status(text):
@@ -1508,13 +1656,15 @@ def _state_line(alive, report, word):
 
 
 def _collect_status(fleet):
-    script = _status_script(fleet.dir)
+    script = _dir_guard(fleet) + _status_script(fleet.dir)
     results = fleet.gather(lambda h: fleet.sh(h, script, timeout=30))
     out = {}
     for host in fleet.plan.hosts:
         rc, text = results[host]
         if rc != 0:
-            out[host] = (False, None, "UNREACHABLE")
+            # A refused directory is not an unreachable host: the host
+            # answered, and said why nothing there can be trusted.
+            out[host] = (False, None, _refused(text) or "UNREACHABLE")
             continue
         out[host] = _parse_status(text)
     return out
@@ -1582,6 +1732,8 @@ def cmd_status(args):
             time.sleep(args.watch)
         except KeyboardInterrupt:
             break
+    # A report, so it exits 0 whatever it found -- an unreachable host or a
+    # refused --remote-dir included, each named on its own line.
     return 0
 
 
@@ -1713,8 +1865,9 @@ else
 fi
 [ -n "$keep" ] || exit 0
 printf '%s\\n' "$keep" | sort -u | tar cf - -T - 2>/dev/null
-""".format(d=shlex.quote(rdir), always=" ".join(ALWAYS), out=OUT_NAME,
-           extra=extra or "''", max=int(max_bytes), mark=OVERSIZE_MARK)
+""".format(d=shlex.quote(_dir_path(rdir)), always=" ".join(ALWAYS),
+           out=OUT_NAME, extra=extra or "''", max=int(max_bytes),
+           mark=OVERSIZE_MARK)
 
 
 def _clean_relpath(name):
@@ -1818,8 +1971,9 @@ def cmd_collect(args, plan=None):
     dest = default_dir(args.dir)
     if fleet.dry_run:
         log("# %d host(s): %s" % (len(plan.hosts), " ".join(plan.hosts[:8])))
-        sys.stdout.write(_collect_script(fleet.dir, plan.collect,
-                                         args.max_bytes))
+        sys.stdout.write(_dir_guard(fleet, to_stderr=True)
+                         + _collect_script(fleet.dir, plan.collect,
+                                           args.max_bytes))
         return 0
     try:
         os.makedirs(dest)
@@ -1827,7 +1981,9 @@ def cmd_collect(args, plan=None):
         if exc.errno != errno.EEXIST:
             die("cannot create %s: %s" % (dest, exc))
 
-    script = _collect_script(fleet.dir, plan.collect, args.max_bytes)
+    # The guard speaks on stderr: stdout is the tar.
+    script = (_dir_guard(fleet, to_stderr=True)
+              + _collect_script(fleet.dir, plan.collect, args.max_bytes))
     # Names are claimed under a lock-free protocol only because each host
     # owns a disjoint slice of the namespace (the host name is in every
     # name); the set is filled in plan order below, off the threads.
@@ -2103,7 +2259,7 @@ def render_summary(plan, states, args, waves=0):
 def cmd_stop(args, plan=None):
     plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
-    script = _kill_block(fleet.dir) + STOP_TAIL
+    script = _dir_guard(fleet) + _kill_block(fleet.dir) + STOP_TAIL
     failed = fleet.each(lambda h: fleet.sh(h, script), "stopping the job")
     log("[tx] whatever the job produced is still on the hosts:")
     log("[tx]   tx collect     # bring it back")
@@ -2123,6 +2279,11 @@ def cmd_logs(args):
 
     def one(host):
         name = local_name(plan.tag, host, LOG_NAME)
+        # scp reads before any shell runs, so the directory is checked
+        # first, in a round trip of its own.
+        rc, out = fleet.sh(host, _dir_guard(fleet), timeout=30)
+        if rc != 0:
+            return rc, out
         rc, out = fleet.pull(host, LOG_NAME, os.path.join(dest, name))
         if rc != 0:
             return rc, "no agent log: %s" % out
@@ -2218,9 +2379,16 @@ fi
 
 
 def _clean_script(rdir):
+    # A deploy's staging directory (and the start's temporary pid file)
+    # is tx's too: one cut short -- the ssh dropped between the copy and
+    # the rename -- leaves it behind, and it is not a stranger's file.
+    # `_dir_guard` runs first, so only the ssh user (or, with
+    # --allow-shared-remote-dir, its group) could have made one.
+    own = [shlex.quote(n) for n in _own_names()]
+    own.append(shlex.quote(STAGE_PREFIX) + "*")
     return _kill_block(rdir) + CLEAN_TAIL.format(
         pgrep=PGREP_MINE, mark=UNVERIFIED, manifest=MANIFEST_NAME,
-        own="|".join(shlex.quote(n) for n in _own_names()))
+        own="|".join(own))
 
 
 def cmd_clean(args, plan=None):
@@ -2237,7 +2405,7 @@ def cmd_clean(args, plan=None):
         if reply.strip().lower() != "yes":
             log("[tx] nothing done")
             return 1
-    script = _clean_script(fleet.dir)
+    script = _dir_guard(fleet) + _clean_script(fleet.dir)
     log("[tx] removing every trace on %d hosts" % len(plan.hosts))
     results = fleet.gather(lambda h: fleet.sh(h, script))
     failed = fleet.report(plan.hosts, results)
@@ -3257,6 +3425,15 @@ def cmd_check(args):
             problems += 1
     log("[tx] collect out/ and the run record, plus: %s"
         % (" ".join(plan.collect) if plan.collect else "(nothing extra)"))
+    # The --remote-dir guard (TX-002) is a property of each host, which
+    # this command does not contact; so it says what will be checked and
+    # where the per-host answer is, and catches the one thing it can see.
+    log("[tx] remote %s on each host: must be a real directory the ssh "
+        "user owns, not writable by %s (tx doctor checks each host)"
+        % (plan.remote_dir,
+           "others (its group may: TX_ALLOW_SHARED_REMOTE_DIR=1)"
+           if _env("TX_ALLOW_SHARED_REMOTE_DIR", "") == "1"
+           else "group or others"))
     if problems:
         log("[tx] %d problem(s) above would break the run" % problems)
         return 1
@@ -3276,15 +3453,31 @@ def cmd_doctor(args):
     log("  plan        %s: %d hosts, timeout %s"
         % (plan.path, len(plan.hosts), fmt_secs(plan.timeout)))
 
+    # The --remote-dir is checked first, as start will check it (TX-002),
+    # so a host whose directory start would refuse is not called ready, and
+    # the refusal shows here rather than half way into a run. A refused
+    # directory is not looked into: its agent.pid is not read.
+    #
     # agent_running is this --remote-dir's agent, by the same test stop and
     # clean use: another run's agent on the host, or another user's, is
     # not this run still going. proc= says whether a lost agent.pid can be
     # traced -- without /proc, stop and clean refuse rather than guess.
-    script = """
+    script = DIR_CHECK_FN + """
 py=$({py} -V 2>&1 || echo 'MISSING python3')
 bash=$(bash --version 2>/dev/null | head -1 || echo 'MISSING bash')
 d={rdir}
-here=$(CDPATH= cd -- "$d" 2>/dev/null && pwd -P)
+_tx_shared={shared}
+refused=""
+here=""
+if ! _tx_dir_check "$d"; then
+    rd=REFUSED
+    refused="REFUSED: --remote-dir $_tx_bad. {how}"
+elif [ -d "$d" ]; then
+    rd="ok($(ls -ld -- "$d" | cut -c1-10))"
+    here=$(CDPATH= cd -- "$d" 2>/dev/null && pwd -P)
+else
+    rd="absent(start makes it, mode 700)"
+fi
 {probe}
 running=no
 if [ -n "$here" ]; then
@@ -3297,16 +3490,21 @@ if [ -n "$here" ]; then
 fi
 free=$(df -Pk {parent} 2>/dev/null | awk 'NR==2{{print $4}}')
 [ -z "$free" ] && free=$(df -Pk / 2>/dev/null | awk 'NR==2{{print $4}}')
-echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); pgrep=$(command -v pgrep >/dev/null && echo yes || echo 'no (clean cannot rule out a stray agent)'); proc=$([ "$have_proc" = yes ] && echo yes || echo 'no (a lost agent.pid cannot be traced)'); agent_running=$running"
-""".format(py=shlex.quote(fleet.python), rdir=shlex.quote(fleet.dir),
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); pgrep=$(command -v pgrep >/dev/null && echo yes || echo 'no (clean cannot rule out a stray agent)'); proc=$([ "$have_proc" = yes ] && echo yes || echo 'no (a lost agent.pid cannot be traced)'); agent_running=$running; remote_dir=$rd"
+if [ -n "$refused" ]; then echo "$refused"; exit 1; fi
+""".format(py=shlex.quote(fleet.python),
+           rdir=shlex.quote(_dir_path(fleet.dir)),
            parent=shlex.quote(os.path.dirname(fleet.dir) or "/"),
-           pid=PID_NAME, probe=_probe())
+           pid=PID_NAME, probe=_probe(),
+           shared="1" if fleet.shared else "0", how=REFUSED_HOW)
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
-                        "checking hosts (ssh, python, bash, tar, pgrep, disk)")
+                        "checking hosts (ssh, python, bash, tar, pgrep, disk, "
+                        "--remote-dir)")
     if failed:
-        log("[tx] fix ssh/python on those hosts first: key-based ssh must "
-            "work non-interactively (ssh-copy-id) and `%s` must exist."
+        log("[tx] fix those hosts first: key-based ssh must work "
+            "non-interactively (ssh-copy-id), `%s` must exist, and a "
+            "--remote-dir marked REFUSED must be the ssh user's own."
             % fleet.python)
         return 1
 
@@ -3397,6 +3595,15 @@ HINTS = [
      "instant, and a pass/fail state. Append after every run and the viewer "
      "aggregates the history; `tx export --from results` re-exports a "
      "collection without ssh."),
+    ("run from a working directory a group shares on purpose",
+     "tx gen ... --remote-dir /srv/bench/tx",
+     "tx run --allow-shared-remote-dir",
+     "tx refuses a --remote-dir that is a symlink, is not the ssh user's "
+     "own, or that its group or others can write to: whoever can write "
+     "there could swap the agent before it runs. --allow-shared-remote-dir "
+     "(TX_ALLOW_SHARED_REMOTE_DIR=1) lets a group-writable one through; a "
+     "world-writable one, a symlink or another user's is still refused. "
+     "tx doctor shows each host's answer before a run."),
     ("prove the runs really were simultaneous",
      "tx summarize",
      "",
@@ -3462,6 +3669,10 @@ def _add_fleet_flags(p):
                    metavar="DIR",
                    help="working directory on each host (default: from "
                         "the plan)")
+    p.add_argument("--allow-shared-remote-dir", action="store_true",
+                   default=_env("TX_ALLOW_SHARED_REMOTE_DIR", "") == "1",
+                   help="let --remote-dir be group-writable, for a directory "
+                        "a group shares on purpose")
     p.add_argument("--python", default=_env("TX_PYTHON", "python3"),
                    help="python on the hosts (default: %(default)s)")
     p.add_argument("--ssh", default=_env("TX_SSH", "ssh"),
@@ -3708,7 +3919,8 @@ def cmd_full_help(ap):
     log("                   TX_HOSTS (with --peers)")
     log("flag defaults from: TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER "
         "TX_JOBS")
-    log("                    TX_PYTHON TX_MUSTER MUSTER_POOL")
+    log("                    TX_PYTHON TX_MUSTER MUSTER_POOL "
+        "TX_ALLOW_SHARED_REMOTE_DIR=1")
     return 0
 
 
