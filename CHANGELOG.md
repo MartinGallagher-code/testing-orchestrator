@@ -9,6 +9,46 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-11-23
+
+The agent is isolated from the payload it runs (TX-003). This was
+written as 1.1.1 and rebased three times as the pull requests beside it
+merged first: onto 1.1.1 (TX-001) as 1.1.2, onto 1.2.0 (TX-002) as
+1.2.1, and onto 1.2.1 (TX-004) as 1.2.2. Neither 1.1.2 nor TX-003's
+1.2.1 was published; the 1.2.1 below is TX-004's. It keeps 1.2.0's
+checked, private `--remote-dir` and staged deploy: the agent still runs
+from that directory, now with `-I`.
+
+### Fixed
+
+- **A payload can no longer kill the agent (TX-003).** `tx start` unpacks
+  the payload into the same directory as `tx.py` and ran the agent there as
+  `python3 tx.py agent …`, and Python puts the script's directory first on
+  `sys.path`. So a benchmark that shipped its own top-level `json.py`,
+  `queue.py`, `signal.py`, `shlex.py` or `subprocess.py` replaced that
+  standard module in the agent, which died on startup on every host with
+  nothing but "the agent died on startup" to say why; a module that only
+  misbehaved would have corrupted the run record instead. The agent now
+  starts as `python3 -I tx.py agent …`: isolated mode leaves the script's
+  directory off the path and ignores `PYTHON*` variables, for the agent's
+  own interpreter only. The job is unchanged: it still runs in the payload
+  directory, with the same environment (`PYTHONPATH` and `TX_*` included),
+  and still imports its own helpers from there. The same class of bug was
+  fixed in iperf_orchestrator 2.8.1 (IO-010).
+- `tx check` does not warn about a payload module named after a standard
+  one: it can no longer reach the agent, and the job importing it is the
+  job's own business, the same as when it is run by hand. README.md,
+  *The payload cannot break the agent*, says so.
+
+### Tests
+
+- `tests/test_agent.sh`: a payload whose top level holds `json.py`,
+  `queue.py`, `signal.py` and `subprocess.py`, each fatal on import, runs to
+  completion on three fake hosts with an intact record, and its job imports
+  its own `helper.py`; the job still sees a `PYTHONPATH` it was given; and a
+  mutation that drops `-I` from a copy of `tx.py` shows the agent dying on
+  the same payload.
+
 ## [1.2.1] - 2026-11-23
 
 An adversarial pass over the sweeps (`--batch`, `--resume`, `--muster`),
