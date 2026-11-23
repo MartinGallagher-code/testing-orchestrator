@@ -4257,7 +4257,7 @@ def cmd_full_help(ap):
     log("the job runs with: TX_HOST TX_OUT TX_TAG TX_RUN_ID TX_INDEX "
         "TX_NHOSTS")
     log("                   TX_HOSTS (with --peers) TX_SWEEP_ID (with "
-        "--batch)")
+        "--batch, not --muster)")
     log("flag defaults from: TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER "
         "TX_JOBS")
     log("                    TX_PYTHON TX_MUSTER MUSTER_POOL "

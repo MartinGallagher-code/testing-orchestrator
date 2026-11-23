@@ -24,7 +24,9 @@ last run's files as its own.
   as `.tx-sweep` before the first wave is armed, stamped into every
   host's run record, and given to the job as `$TX_SWEEP_ID`. The coverage
   line and `--resume` both print it. Outside a sweep the record says
-  `"sweep_id": null` and the job has no `TX_SWEEP_ID`. The agent reads
+  `"sweep_id": null` and the job has no `TX_SWEEP_ID`; a `--muster`
+  sweep has no id either, since the pool is its record and it is never
+  resumed. The agent reads
   the id from its environment, not from a new flag: a `--no-deploy`
   start against an agent an older tx put on the host still runs (its
   record then has no id, and resume does not count it).

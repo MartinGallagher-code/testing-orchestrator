@@ -206,7 +206,8 @@ random characters. It is written into the collection directory, as
 `.tx-sweep`, before the first wave is armed. Every host's run record
 carries it as `sweep_id`, and the job sees it as `$TX_SWEEP_ID`. It is
 what tells this sweep's results from an earlier run's, which the next
-section depends on.
+section depends on. A `--muster` sweep has none: the pool is its record,
+and it is never resumed (*Drawing the work from a pool*, below).
 
 ### A sweep survives its own orchestrator
 
@@ -439,7 +440,7 @@ Every job runs under `bash`, in the working directory, with:
 | `TX_INDEX` / `TX_NHOSTS` | This host's position in the fleet — for sharding work. |
 | `TX_TAG` | The run's tag, which leads every collected filename. |
 | `TX_RUN_ID` | The run's stamp, shared by every host in one start. |
-| `TX_SWEEP_ID` | With `--batch`, the sweep's id, shared by every wave of one sweep. Unset otherwise. |
+| `TX_SWEEP_ID` | With `--batch`, the sweep's id, shared by every wave of one sweep. Unset otherwise, and in a `--muster` sweep. |
 | `TX_HOSTS` | The whole host list, with `--peers`. |
 
 and `stdin` from the plan's `stdin =` file, or `/dev/null`.
