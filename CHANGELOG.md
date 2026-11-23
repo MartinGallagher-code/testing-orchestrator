@@ -48,6 +48,13 @@ from that directory, now with `-I`.
   its own `helper.py`; the job still sees a `PYTHONPATH` it was given; and a
   mutation that drops `-I` from a copy of `tx.py` shows the agent dying on
   the same payload.
+- `tests/test_fleet.sh`: the two-runs tests from 1.1.1 hold run B's job at
+  its end until the test has checked B's agent is alive. B used to outlive
+  run A only by the time one `tx start` takes. So on a slow runner, "two
+  runs: doctor sees its own" (and, in principle, "two runs: clean is
+  clean") could see B finish on its own and report it killed. That failed
+  CI's Python 3.9 job on this pull request and failed once in five on
+  `main` locally.
 
 ## [1.2.1] - 2026-11-23
 
