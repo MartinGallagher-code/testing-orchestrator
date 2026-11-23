@@ -315,8 +315,10 @@ t_resuming_a_finished_sweep_does_nothing() {
     run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
         -d results --quiet
     assert_status 0 "$RUN_RC"
+    # The same -d: that directory holds the sweep's id, and resume counts
+    # only results that carry it (TX-008).
     run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
-        -d results2 --resume --quiet
+        -d results --resume --quiet
     assert_status 0 "$RUN_RC"
     assert_contains "$RUN_OUT" "nothing left to cover"
     assert_contains "$RUN_OUT" "2 done, 0 still running, 0 left"

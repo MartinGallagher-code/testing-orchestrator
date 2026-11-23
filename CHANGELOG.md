@@ -9,6 +9,82 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-23
+
+A sweep's results are its own (TX-008). The fleet keeps no history: a
+host holds whatever ran there last, finished and exit 0, and tx
+compared no run id anywhere. So a resumed sweep could count an earlier
+sweep's records as its own, and a `--no-deploy` start could collect the
+last run's files as its own.
+
+### Added
+
+- **Every `--batch` sweep has an id** (`sweep_id`): the time it began and
+  six random hex characters. It is written into the collection directory
+  as `.tx-sweep` before the first wave is armed, stamped into every
+  host's run record, and given to the job as `$TX_SWEEP_ID`. The coverage
+  line and `--resume` both print it. Outside a sweep the record says
+  `"sweep_id": null` and the job has no `TX_SWEEP_ID`. The agent reads
+  the id from its environment, not from a new flag: a `--no-deploy`
+  start against an agent an older tx put on the host still runs (its
+  record then has no id, and resume does not count it).
+
+### Fixed
+
+- **`--resume` counts only this sweep's results.** A full sweep, then a
+  second sweep killed in its first wave and resumed: resume said "2 done,
+  1 still running, 0 left to cover" and "every host ran the job and
+  exited zero", for two hosts that never ran in that sweep. A record now
+  counts as done only if it carries the sweep's id; a host holding an
+  earlier run's result is covered again, and resume says how many.
+- **A `--batch --clean` sweep resumes without running finished waves
+  again.** `--clean` had removed their records from the hosts, so resume
+  found nothing there and ran them a second time. Resume now also reads
+  the collection directory: a host whose finished record from this sweep
+  is already there is done. A record there from another sweep (an earlier
+  sweep into the same `-d`) does not count.
+- **`--resume --clean` cleans what it picks up.** The hosts a resumed
+  sweep re-collected, and the ones it waited for, were collected and then
+  left on the fleet. They are cleaned after collection now, as a wave is.
+- **A start no longer collects the last run's files as its own.** With
+  `--no-deploy` nothing removed the last run's `out/` or its logs, so the
+  collection held `out~first-only.txt` from the run before beside this
+  run's files. Every start now removes `out/`, the record, `stdout`,
+  `stderr`, `setup.log`, `teardown.log` and `agent.log` before it launches
+  the agent, as a deploy already did. (1.2.1 removed only the record.)
+  Files a `--collect` glob finds beside `$TX_OUT` are the job's and are
+  still left alone; README.md, *Results that stay apart*, says so.
+
+### Changed
+
+- **`--resume` needs the sweep's `-d`**, the directory that holds its
+  id. Without `-d`, or with a directory that has no `.tx-sweep` (a sweep
+  begun by tx 1.2.2 or older), it refuses with exit 2 and starts
+  nothing. Before, resume without `-d` collected into a new
+  `tx-<timestamp>` directory, and resume into any directory counted any
+  finished record as done.
+- A sweep run into a directory without `--resume` is a new sweep: it
+  writes its own id there.
+
+### Tests
+
+- `tests/test_sweeps.sh`, new: one id on every record of a two-wave
+  sweep, the job's `$TX_SWEEP_ID`, and none outside a sweep (with a stray
+  `TX_SWEEP_ID` in the environment); week one, then week two killed in
+  its first wave and resumed, runs week one's hosts again; a `--clean`
+  sweep killed in its last wave and resumed runs no host twice and leaves
+  none on the fleet; a record in the collection from an earlier sweep
+  does not count; a `--no-deploy` run after one that wrote `out/` and
+  `setup.log` collects neither; and `--resume` refuses no `-d`, a
+  directory with no sweep, a sweep record with no id and one that is not
+  JSON.
+- `tests/test_mutations.sh`: seven mutations, one per fix, each caught by
+  its test above.
+- `tests/test_waves.sh`: "resuming a finished sweep" resumes with the
+  sweep's own `-d`.
+- `tests/test_adversarial_mutations.sh`: TX-004's mutation of the start's
+  `rm` follows the line it now is.
+
 ## [1.2.2] - 2026-11-23
 
 The agent is isolated from the payload it runs (TX-003). This was

@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.2.2"
+VERSION = "1.3.0"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -126,6 +126,19 @@ STDIN_DEFAULT = ""
 # a job that would not launch at all -- lands there and nowhere else.
 ALWAYS = (REPORT_NAME, STDOUT_NAME, STDERR_NAME, SETUP_LOG, TEARDOWN_LOG,
           LOG_NAME)
+
+# A --batch sweep's own record, in the directory it collects into: the
+# sweep's id, which the agent also stamps into every host's run record
+# (`sweep_id`). The id is what tells this sweep's results from an earlier
+# run's in the same --remote-dir -- the fleet keeps no history, so a host
+# a sweep never reached still holds whatever ran there last, done and
+# exit 0. --resume reads the id from here and counts only records that
+# carry it. A dot name, so `grep -l FAIL *` and `jq . *` pass it by.
+SWEEP_NAME = ".tx-sweep"
+
+# The states a run record ends in: the host has run the job (or failed to)
+# and nothing more is coming from it.
+FINISHED = ("done", "timeout", "setup-failed", "launch-failed")
 
 # The separator between the parts of a collected file's name. `~` is legal
 # in a filename everywhere, needs no shell quoting, and does not occur in
@@ -1016,11 +1029,23 @@ def _run_agent(args, workdir):
     setup_cmd = unb64(args.setup) if args.setup else ""
     teardown_cmd = unb64(args.teardown) if args.teardown else ""
 
+    # The sweep this run is part of, if any. It comes in the environment
+    # rather than as a flag: `tx start --no-deploy` runs whatever agent is
+    # already on the host, and one an older tx put there would refuse an
+    # unknown flag and die on startup. That agent just ignores this, and
+    # its record then carries no sweep id -- which --resume reads, rightly,
+    # as not this sweep's.
+    sweep_id = os.environ.get("TX_SWEEP_ID", "")
+
     env = os.environ.copy()
     env["TX_HOST"] = args.host
     env["TX_OUT"] = outdir
     env["TX_TAG"] = args.tag
     env["TX_RUN_ID"] = args.run_id
+    if sweep_id:
+        env["TX_SWEEP_ID"] = sweep_id
+    else:
+        env.pop("TX_SWEEP_ID", None)
     env["TX_INDEX"] = str(args.index)
     env["TX_NHOSTS"] = str(args.nhosts)
     if args.peers:
@@ -1030,6 +1055,7 @@ def _run_agent(args, workdir):
         "host": args.host,
         "tag": args.tag,
         "run_id": args.run_id,
+        "sweep_id": sweep_id or None,
         "command": run_cmd,
         "armed_for": args.at,
         "index": args.index,
@@ -1385,8 +1411,13 @@ def _start_script(fleet, plan, args, host, at, index, run_id):
     # path and ignores PYTHON* variables, for this interpreter only:
     # os.environ is untouched, so the job, which the agent starts in that
     # same directory with that environment, sees exactly what it did.
-    launch = ("nohup %s -I %s %s < /dev/null >> %s 2>&1 &"
-              % (shlex.quote(fleet.python), shlex.quote(agent),
+    #
+    # TX_SWEEP_ID is set on every launch, empty outside a --batch sweep,
+    # so a value left in the ssh user's environment cannot pass this run
+    # off as some sweep's (the agent reads it: `_run_agent`).
+    launch = ("TX_SWEEP_ID=%s nohup %s -I %s %s < /dev/null >> %s 2>&1 &"
+              % (shlex.quote(getattr(args, "sweep_id", "") or ""),
+                 shlex.quote(fleet.python), shlex.quote(agent),
                  " ".join(shlex.quote(f) for f in flags), LOG_NAME))
     # The directory is checked again first, in this same ssh: what runs is
     # what is in it now, not what the deploy saw a round trip ago. The pid
@@ -1400,10 +1431,13 @@ here=$(pwd -P)
 if [ -f {pid} ] && tx_ours "$(cat {pid} 2>/dev/null)"; then
     echo 'already running -- tx stop first'; exit 1
 fi
-# An earlier run's record must not answer for this one. With --no-deploy
-# nothing else removes it, and an agent that died on startup then read
-# as 'ran already' -- and its old exit 0 as this run passing.
-rm -f {report}
+# An earlier run's outputs must not answer for this one. With --no-deploy
+# nothing else removes them: its record made an agent that died on
+# startup read as 'ran already' -- and its old exit 0 as this run passing
+# -- and its out/ and logs came back in this run's collection, as if this
+# run had written them. The deploy removes the same names; a start does
+# too, so the two cannot drift apart.
+rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
 {launch}
 agent_pid=$!
 t={stage}pid.$$
@@ -1425,7 +1459,8 @@ else
 fi
 """.format(d=shlex.quote(_dir_path(fleet.dir)), pid=PID_NAME, launch=launch,
            log=LOG_NAME, report=REPORT_NAME, stage=STAGE_PREFIX,
-           probe=_probe())
+           out=OUT_NAME, stdout=STDOUT_NAME, stderr=STDERR_NAME,
+           setuplog=SETUP_LOG, teardownlog=TEARDOWN_LOG, probe=_probe())
 
 
 def _kill_block(rdir):
@@ -1726,8 +1761,7 @@ def _has_result(entry):
     _alive, report, _word = entry
     if report is None:
         return False
-    return report.get("state") in ("done", "timeout", "setup-failed",
-                                   "launch-failed")
+    return report.get("state") in FINISHED
 
 
 def _still_working(entry):
@@ -1756,8 +1790,7 @@ def _is_finished(entry):
         return True
     if report is None:
         return False
-    if report.get("state") in ("done", "timeout", "setup-failed",
-                               "launch-failed"):
+    if report.get("state") in FINISHED:
         return True
     # No result and no agent: nothing more is coming from this host.
     return not alive
@@ -2568,6 +2601,114 @@ def waves_of(hosts, size):
     return [hosts[i:i + size] for i in range(0, len(hosts), size)]
 
 
+def _new_sweep_id():
+    """A new sweep's id: when it began, and enough randomness that two
+    sweeps begun in the same second are still two."""
+    return time.strftime("%Y%m%d-%H%M%S-") + os.urandom(3).hex()
+
+
+def _begin_sweep(args, plan):
+    """Give a new sweep its id, written into its collection directory
+    before the first wave is armed. Returns the id.
+
+    Before, not after: a sweep killed in its first wave has collected
+    nothing yet, and --resume still has to know which records are its. A
+    directory that held an earlier sweep's id gets this one's: a sweep run
+    into it without --resume is a new sweep, and what the old one left
+    there no longer counts as done for anybody.
+    """
+    sweep = _new_sweep_id()
+    if getattr(args, "dry_run", False):
+        return sweep
+    try:
+        os.makedirs(args.dir)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            die("cannot create %s: %s" % (args.dir, exc))
+    try:
+        _write_json(os.path.join(args.dir, SWEEP_NAME),
+                    {"sweep_id": sweep, "tag": plan.tag,
+                     "began": time.strftime("%Y-%m-%d %H:%M:%S %z")})
+    except (IOError, OSError) as exc:
+        die("cannot write %s: %s" % (os.path.join(args.dir, SWEEP_NAME),
+                                     exc))
+    return sweep
+
+
+def _sweep_of(dest):
+    """The id of the sweep collecting into `dest`, or die saying why there
+    is none to resume.
+
+    Without it nothing on the fleet can be told apart: a host the sweep
+    never reached still holds the last run's record, finished and exit 0,
+    and counting that as done is how a resumed sweep reported hosts it
+    never ran as passing.
+    """
+    path = os.path.join(dest, SWEEP_NAME)
+    try:
+        with open(path) as fh:
+            sweep = json.load(fh)
+    except (IOError, OSError) as exc:
+        if exc.errno != errno.ENOENT:
+            die("--resume: cannot read %s: %s" % (path, exc))
+        die("--resume: %s/ holds no sweep (no %s in it). Give -d the "
+            "directory the sweep was collecting into: it holds the sweep's "
+            "id, which is how resume tells the sweep's results from an "
+            "earlier run's. A sweep begun by tx 1.2.2 or older has no id; "
+            "run it again without --resume." % (dest, SWEEP_NAME))
+    except ValueError as exc:
+        die("--resume: %s is not a sweep record (%s)" % (path, exc))
+    sweep = sweep.get("sweep_id") if isinstance(sweep, dict) else None
+    if not sweep or not isinstance(sweep, str):
+        die("--resume: %s names no sweep id, so this sweep's results "
+            "cannot be told from an earlier run's" % path)
+    return sweep
+
+
+def _of_sweep(report, sweep):
+    """Is this run record one of `sweep`'s?"""
+    return (bool(sweep) and isinstance(report, dict)
+            and report.get("sweep_id") == sweep)
+
+
+def _filed_result(dest, tag, host, sweep):
+    """`host`'s finished record from `sweep`, as the collection directory
+    already holds it, or None.
+
+    A --clean sweep removes each wave from its hosts once it has been
+    collected, so for those hosts the collection is the only record left.
+    Asking the fleet alone found nothing there, and resume ran every
+    finished wave a second time.
+    """
+    path = os.path.join(dest, local_name(tag, host, REPORT_NAME))
+    try:
+        with open(path) as fh:
+            report = json.load(fh)
+    except (IOError, OSError, ValueError):
+        return None
+    if (_of_sweep(report, sweep) and report.get("host") == host
+            and report.get("state") in FINISHED):
+        return report
+    return None
+
+
+def _hosts_line(hosts, most=8):
+    return " ".join(hosts[:most]) + (" ..." if len(hosts) > most else "")
+
+
+def _collect_wave(args, sub):
+    """What a wave does once its hosts have finished: collect them into
+    the sweep's directory and, with --clean, clean them. For the hosts a
+    resumed sweep picks up from the interrupted one, which used to be
+    collected and then left on the fleet whatever --clean said. True if
+    either went wrong."""
+    bad = bool(cmd_collect(args, sub))
+    if args.clean:
+        args.yes = True
+        bad = bool(cmd_clean(args, sub)) or bad
+    return bad
+
+
 def run_in_waves(args, plan):
     """Cover the whole fleet a few hosts at a time.
 
@@ -2591,30 +2732,66 @@ def run_in_waves(args, plan):
     # results across ten of them.
     args.dir = default_dir(args.dir)
 
-    if args.resume:
+    if not args.resume:
+        args.sweep_id = _begin_sweep(args, plan)
+    else:
         # No progress file, no state in this process: the answer is
         # already on the hosts, in the same run.json every other command
-        # reads. One status sweep says where the fleet stands, and that
-        # is what makes a sweep survive its own orchestrator being
-        # killed.
+        # reads, and in what the sweep has collected so far. One status
+        # sweep says where the fleet stands, and that is what makes a
+        # sweep survive its own orchestrator being killed.
         #
-        # Three answers, not two. A host with a result is done. A host
-        # still working is one the interrupted sweep left running --
-        # agents are detached, so the work outlived the orchestrator --
-        # and restarting it would trample a run that is nearly finished.
-        # Only what is neither gets covered in waves.
-        log("[tx] --resume: asking the fleet where it got to")
+        # Only *this* sweep's records count, by the id the collection
+        # directory holds and every record carries. The fleet keeps no
+        # history: a host this sweep never reached still holds the last
+        # run's record, finished and exit 0, and taking that for this
+        # sweep's result reported hosts that never ran as passing.
+        #
+        # Three answers, not two. A host with a result is done -- on the
+        # host, or already in the collection, where a --clean sweep left
+        # it. A host still working is one the interrupted sweep left
+        # running -- agents are detached, so the work outlived the
+        # orchestrator -- and restarting it would trample a run that is
+        # nearly finished. Only what is neither gets covered in waves.
+        sweep = args.sweep_id = _sweep_of(args.dir)
+        log("[tx] --resume: asking the fleet where it got to (sweep %s)"
+            % sweep)
         seen = _collect_status(Fleet(plan, args))
-        already = [h for h in plan.hosts if _has_result(seen[h])]
+        filed = {}
+        for h in plan.hosts:
+            report = _filed_result(args.dir, plan.tag, h, sweep)
+            if report is not None:
+                filed[h] = report
+        held = [h for h in plan.hosts
+                if _has_result(seen[h]) and _of_sweep(seen[h][1], sweep)]
+        already = [h for h in plan.hosts if h in filed or h in held]
+        # An agent that has not written its record yet cannot say whose it
+        # is, so it is waited on and asked again when it has.
         busy = [h for h in plan.hosts
-                if h not in set(already) and _still_working(seen[h])]
+                if h not in already and _still_working(seen[h])
+                and (seen[h][1] is None or _of_sweep(seen[h][1], sweep))]
         hosts = [h for h in plan.hosts
-                 if h not in set(already) and h not in set(busy)]
+                 if h not in already and h not in busy]
         log("[tx] %d done, %d still running, %d left to cover"
             % (len(already), len(busy), len(hosts)))
-        states.update(dict((h, seen[h]) for h in already))
+        earlier = [h for h in hosts if _has_result(seen[h])]
+        if earlier:
+            log("[tx] %d of those hold an earlier run's result, not this "
+                "sweep's, so they run again: %s"
+                % (len(earlier), _hosts_line(earlier)))
+        elsewhere = [h for h in hosts if _still_working(seen[h])]
+        if elsewhere:
+            log("[tx] %d host(s) are running another run's job, which this "
+                "sweep neither waits for nor counts (tx stop it, or resume "
+                "once it ends): %s" % (len(elsewhere), _hosts_line(elsewhere)))
+        for h in already:
+            states[h] = seen[h] if h in held else (False, filed[h], None)
 
-        if already:
+        kept = [h for h in already if h not in held]
+        if kept:
+            log("[tx] %d finished host(s) are already in %s/ and need "
+                "nothing more" % (len(kept), args.dir))
+        if held:
             # Collect them again rather than assuming the interrupted
             # sweep got that far. A host that finished the job and was
             # killed before its results were fetched has a result *on
@@ -2625,8 +2802,8 @@ def run_in_waves(args, plan):
             # identical files; losing one costs the run.
             log("[tx] re-collecting the %d finished host(s), in case the "
                 "interrupted sweep never got their results back"
-                % len(already))
-            if cmd_collect(args, slice_plan(plan, already)):
+                % len(held))
+            if _collect_wave(args, slice_plan(plan, held)):
                 trouble.append(0)
 
         if busy:
@@ -2636,11 +2813,16 @@ def run_in_waves(args, plan):
             busy_states, finished = _wait_for_fleet(
                 Fleet(sub, args), _wait_deadline(args, sub),
                 pinned=args.poll)
-            states.update(busy_states)
             if not finished:
                 trouble.append(0)
-            if cmd_collect(args, sub):
+            mine = [h for h in busy if _of_sweep(busy_states[h][1], sweep)]
+            states.update(dict((h, busy_states[h]) for h in mine))
+            if mine and _collect_wave(args, slice_plan(plan, mine)):
                 trouble.append(0)
+            # One that turned out to be another run's is this sweep's to
+            # cover, like any other host without its result.
+            strays = set(busy) - set(mine)
+            hosts = [h for h in plan.hosts if h in set(hosts) or h in strays]
 
         if not hosts:
             log("[tx] nothing left to cover.")
@@ -2651,9 +2833,11 @@ def run_in_waves(args, plan):
             return 1 if (rc or trouble) else 0
 
     waves = waves_of(hosts, args.batch)
-    log("[tx] coverage: %d host%s in %d wave%s of at most %d -> %s/"
+    log("[tx] coverage: %d host%s in %d wave%s of at most %d -> %s/ "
+        "(sweep %s)"
         % (len(hosts), "" if len(hosts) == 1 else "s", len(waves),
-           "" if len(waves) == 1 else "s", args.batch, args.dir))
+           "" if len(waves) == 1 else "s", args.batch, args.dir,
+           args.sweep_id))
     for n, wave in enumerate(waves, 1):
         log("")
         log("[tx] === wave %d of %d: %s ==="
@@ -3972,8 +4156,8 @@ def build_parser():
     r.add_argument("-b", "--batch", type=int, default=None, metavar="N",
                    help="run N hosts at a time, in waves")
     r.add_argument("--resume", action="store_true",
-                   help="with --batch, skip hosts that already have a "
-                        "result")
+                   help="with --batch and the sweep's -d, skip hosts that "
+                        "already have that sweep's result")
     r.add_argument("--muster", nargs="?",
                    const=_env("MUSTER_POOL", "muster.csv"), default=None,
                    metavar="POOL",
@@ -4072,7 +4256,8 @@ def cmd_full_help(ap):
     log("")
     log("the job runs with: TX_HOST TX_OUT TX_TAG TX_RUN_ID TX_INDEX "
         "TX_NHOSTS")
-    log("                   TX_HOSTS (with --peers)")
+    log("                   TX_HOSTS (with --peers) TX_SWEEP_ID (with "
+        "--batch)")
     log("flag defaults from: TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER "
         "TX_JOBS")
     log("                    TX_PYTHON TX_MUSTER MUSTER_POOL "
@@ -4130,6 +4315,11 @@ def main(argv=None):
     elif getattr(args, "lease", ""):
         die("--lease sets how long a --muster wave holds its items; "
             "without --muster there is no pool and no lease to set")
+    # Without -d the collection directory is a new tx-<timestamp>, which no
+    # sweep has collected into and which holds no sweep's id.
+    if getattr(args, "resume", False) and not getattr(args, "dir", ""):
+        die("--resume picks up the sweep collecting into -d DIR, which "
+            "holds that sweep's id: give the -d the sweep was started with")
     try:
         return COMMANDS[args.cmd](args) or 0
     except KeyboardInterrupt:
