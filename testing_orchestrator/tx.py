@@ -1152,14 +1152,22 @@ def _run_agent(args, workdir):
             # "running" for a host that was doing nothing at all, and put
             # the only explanation in the agent's log where `tx collect`
             # could not see it. It is a result, so it is recorded as one.
+            #
+            # What it said goes to stderr first, and the record is written
+            # once, whole: whatever reads launch-failed -- tx status, tx
+            # collect, a test -- finds the reason already there. Written
+            # the other way round, a record read between the two writes
+            # said launch-failed with an empty stderr and no stderr_tail.
+            try:
+                ferr.write(("tx agent: the job would not start: %s\n"
+                            % exc).encode("utf-8"))
+                ferr.flush()
+            except (OSError, IOError):
+                pass  # the record still says why, in its detail
             report["state"] = "launch-failed"
             report["detail"] = str(exc)
             report["finished_at"] = time.time()
             report["duration"] = report["finished_at"] - started
-            _write_json(REPORT_NAME, report)
-            ferr.write(("tx agent: the job would not start: %s\n"
-                        % exc).encode("utf-8"))
-            ferr.flush()
             report["stderr_tail"] = _tail_text(STDERR_NAME)
             _write_json(REPORT_NAME, report)
             return 1

@@ -37,6 +37,16 @@ told about before.
   and exited 0. A host that is down while others have records is still
   exported, as `UNREACHABLE`, and still exits 0.
 
+### Fixed
+
+- **A job that could not start is recorded once, with its reason.** The
+  agent wrote the record as `launch-failed`, then the "would not start"
+  line to stderr, then the record again with that line as
+  `stderr_tail`; a reader between the two writes saw `launch-failed`
+  with no reason. `tests/test_streams.sh`'s "no bash to run it" test
+  read it there on two of CI's six Python jobs. The line is now written
+  first and the record once.
+
 ### Docs
 
 - README's *Exit status* says what `tx status` and `tx export` exit
