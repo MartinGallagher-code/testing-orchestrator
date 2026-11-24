@@ -248,6 +248,58 @@ m_muster_ignores_its_clean() {
     caught test_muster.sh "an uncleaned wave is counted"
 }
 
+# ---- a sweep's results are its own (TX-008) --------------------------------
+
+m_resume_counts_any_result() {
+    # The bug as it was: any finished record on a host is this sweep's.
+    mutant '                if _has_result(seen[h]) and _of_sweep(seen[h][1], sweep)]' \
+           '                if _has_result(seen[h])]' || return 1
+    caught test_sweeps.sh "an earlier sweep's hosts run again"
+}
+
+m_resume_ignores_the_collection() {
+    # Only the fleet asked: a --clean sweep's finished waves run again.
+    mutant '            report = _filed_result(args.dir, plan.tag, h, sweep)' \
+           '            report = None' || return 1
+    caught test_sweeps.sh "a clean sweep resumes, no host twice"
+}
+
+m_the_collection_counts_any_sweep() {
+    mutant '    if (_of_sweep(report, sweep) and report.get("host") == host' \
+           '    if (report.get("host") == host' || return 1
+    caught test_sweeps.sh "another sweep's filed record"
+}
+
+m_resume_leaves_its_hosts() {
+    # What resume picked up was collected, and never cleaned.
+    mutant '    bad = bool(cmd_collect(args, sub))
+    if args.clean:' '    bad = bool(cmd_collect(args, sub))
+    if False:' || return 1
+    caught test_sweeps.sh "a clean sweep resumes, no host twice"
+}
+
+m_the_agent_is_never_told_the_sweep() {
+    # No TX_SWEEP_ID on the launch: no record carries the id, and a value
+    # left in the environment passes for one.
+    mutant '    launch = ("TX_SWEEP_ID=%s nohup' '    launch = (": %s; nohup' \
+        || return 1
+    caught test_sweeps.sh "one id on every record"
+}
+
+m_a_start_keeps_the_last_out() {
+    mutant 'rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
+{launch}' 'rm -rf {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
+{launch}' || return 1
+    caught test_sweeps.sh "no-deploy collects only this run"
+}
+
+m_a_start_keeps_the_last_logs() {
+    mutant 'rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
+{launch}' 'rm -rf {out} {report} {stdout} {stderr} {teardownlog} {log}
+{launch}' || return 1
+    caught test_sweeps.sh "no-deploy collects only this run"
+}
+
 echo "mutations"
 run_test "stop waiting on any agent is caught"  m_stop_waits_on_any_agent
 run_test "trusting a live pid is caught"        m_a_live_pid_is_trusted
@@ -261,4 +313,11 @@ run_test "an agent recording nothing is caught" m_the_agent_records_nothing
 run_test "run ignoring its clean is caught"     m_run_ignores_its_clean
 run_test "waves ignoring clean is caught"       m_waves_ignore_their_clean
 run_test "muster ignoring clean is caught"      m_muster_ignores_its_clean
+run_test "resume counting any result is caught" m_resume_counts_any_result
+run_test "resume ignoring results/ is caught"   m_resume_ignores_the_collection
+run_test "any sweep's filed record is caught"   m_the_collection_counts_any_sweep
+run_test "resume leaving hosts is caught"       m_resume_leaves_its_hosts
+run_test "an untold agent is caught"            m_the_agent_is_never_told_the_sweep
+run_test "a start keeping out/ is caught"       m_a_start_keeps_the_last_out
+run_test "a start keeping logs is caught"       m_a_start_keeps_the_last_logs
 report_tests

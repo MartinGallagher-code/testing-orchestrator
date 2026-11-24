@@ -30,8 +30,8 @@ MUTATIONS=$(cat <<'TABLE'
 ---                      or gone) else 1
 +++                      ) else 1
 ### t_an_earlier_runs_record_does_not_answer_for_this_one
---- rm -f {report}
-+++ : rm -f {report}
+--- rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
++++ : rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
 ### t_the_wait_and_the_lease_count_setup_and_teardown
 ---     extra = (1 if plan.setup else 0) + (1 if plan.teardown else 0)
 +++     extra = 0

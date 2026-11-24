@@ -174,7 +174,7 @@ the point of covering the fleet is to end with one set of results for
 all of it:
 
 ```text
-[tx] coverage: 200 hosts in 10 waves of at most 20 -> results/
+[tx] coverage: 200 hosts in 10 waves of at most 20 -> results/ (sweep 20260911-201500-3f9a1c)
 
 [tx] === wave 1 of 10: web01 web02 web03 web04 web05 web06 web07 web08 ... ===
 ...
@@ -201,19 +201,29 @@ rack should not cost the other nine their coverage. `--stop-on-fail`
 stops instead, and the hosts nobody got to are reported as `NOT REACHED`
 rather than quietly counted as passes.
 
+**Every sweep has an id**, made when it begins: the time, and a few
+random characters. It is written into the collection directory, as
+`.tx-sweep`, before the first wave is armed. Every host's run record
+carries it as `sweep_id`, and the job sees it as `$TX_SWEEP_ID`. It is
+what tells this sweep's results from an earlier run's, which the next
+section depends on. A `--muster` sweep has none: the pool is its record,
+and it is never resumed (*Drawing the work from a pool*, below).
+
 ### A sweep survives its own orchestrator
 
 A ten-wave sweep can take hours, and `tx run` has to stay alive to
 sequence it. If it doesn't — you closed the laptop, the ssh session
 dropped, somebody hit ^C — `--resume` picks it up from the fleet's own
-record. Nothing is remembered here, so there is nothing to lose:
+record and the sweep's collection. Nothing else is remembered here, so
+there is nothing to lose. Give it the same `-d` the sweep was started
+with: that directory holds the sweep's id.
 
 ```bash
 tx run --batch 20 -d results --resume
 ```
 
 ```text
-[tx] --resume: asking the fleet where it got to
+[tx] --resume: asking the fleet where it got to (sweep 20260911-201500-3f9a1c)
 [tx] 120 done, 20 still running, 60 left to cover
 [tx] re-collecting the 120 finished host(s), in case the interrupted sweep never got their results back
 [tx] waiting for the 20 host(s) the interrupted sweep left running rather than starting them over
@@ -229,6 +239,34 @@ neither gets covered in fresh waves — including a host whose record
 stopped mid-job with no agent left behind it (a reboot, an OOM kill):
 that host has no result and nothing is coming, so it is run again
 rather than waited on.
+
+**Only this sweep's results count.** The fleet keeps no history: a host
+the sweep never reached still holds whatever ran there last, finished
+and exit 0. So a record counts as done only if it carries this sweep's
+id. A host holding an earlier run's result is covered again, and resume
+says how many of those it found. Before 1.3.0, resume counted any
+finished record: a sweep killed in its first wave and resumed reported
+hosts it never ran as passing.
+
+**A `--clean` sweep resumes too.** `--clean` removes each wave from its
+hosts once it has been collected, so for those hosts the collection is
+the only record left. Resume reads it: a host whose finished record from
+this sweep is already in the `-d` directory is done (`N finished host(s)
+are already in results/ and need nothing more`), and is not run again.
+With `--clean`, the hosts resume picks up from the interrupted sweep are
+cleaned too, once they are collected.
+
+`--resume` refuses rather than guess: without `-d`, or with a directory
+that holds no `.tx-sweep` (a sweep begun by tx 1.2.2 or older, or not a
+sweep's directory at all), nothing is started. Run that sweep again
+without `--resume`. A sweep run into a directory without `--resume` is a
+new sweep: it writes its own id there, and what an earlier sweep
+collected into that directory no longer counts as done.
+
+A host that is running another run's job when you resume is not this
+sweep's work, so it is neither waited for nor counted. Resume names it,
+and its wave does not start: the deploy says "a job is already running
+here -- tx stop first". Stop that job, or resume again once it has ended.
 
 ### How often it asks
 
@@ -402,6 +440,7 @@ Every job runs under `bash`, in the working directory, with:
 | `TX_INDEX` / `TX_NHOSTS` | This host's position in the fleet — for sharding work. |
 | `TX_TAG` | The run's tag, which leads every collected filename. |
 | `TX_RUN_ID` | The run's stamp, shared by every host in one start. |
+| `TX_SWEEP_ID` | With `--batch`, the sweep's id, shared by every wave of one sweep. Unset otherwise, and in a `--muster` sweep. |
 | `TX_HOSTS` | The whole host list, with `--peers`. |
 
 and `stdin` from the plan's `stdin =` file, or `/dev/null`.
@@ -470,6 +509,20 @@ run's own JSON record — always. The agent's log is in that list because
 it is where anything the agent could not turn into a record ends up, and
 a run that went wrong is exactly when you need it. `--collect GLOB` adds anything else you want, evaluated
 on the host.
+
+**Only this run's.** Every start — `tx start`, `tx run`, each wave of a
+sweep, with `--no-deploy` as well as without — first removes the last
+run's `out/`, run record, `stdout`, `stderr`, `setup.log`, `teardown.log`
+and `agent.log` on each host. So collect what you want from one run
+before you start the next on the same hosts. Before 1.3.0 a `--no-deploy`
+start kept them, and its collection brought the last run's `out/` and
+logs back as though this run had written them.
+
+What `--collect GLOB` finds *beside* `TX_OUT` is not removed by a start
+or a deploy: it is the job's own (or the payload's), not tx's. A file an
+earlier run wrote there, and this run did not write again, comes back in
+this run's collection. Have the job write its results into `$TX_OUT`, or
+remove its own old files before it writes new ones.
 
 **`--max-bytes` is the ceiling**, 100 MB per file by default. A benchmark's
 results are usually small and what this stops is the exception — a core
