@@ -61,6 +61,9 @@ still running or what to type next.
   puts back what never ran and leaves only the running item held; and
   a `--muster` wave interrupted while arming puts all its items back.
 - `tests/test_mutations.sh`: each of those fixes, reverted, is caught.
+- `tests/test_remote_dir_mutations.sh`: the two mutations of the
+  stand-down's and `tx stop`'s `--remote-dir` guard name their own
+  places again, now that both go through the same script line.
 
 ## [1.3.0] - 2026-11-23
 
