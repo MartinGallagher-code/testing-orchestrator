@@ -84,7 +84,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -348,6 +348,23 @@ def die(msg, code=2):
 def log(msg):
     sys.stdout.write("%s\n" % msg)
     sys.stdout.flush()
+
+
+class Interrupted(KeyboardInterrupt):
+    """Ctrl-C, once tx has done and said what it does about one.
+
+    Raised in place of the KeyboardInterrupt it answers, by the code that
+    knew what was going on when the key was pressed: it has already left
+    the hosts the way a Ctrl-C at that moment leaves them, and told the
+    person what is still running and what to type next. `main` exits 130
+    without adding a word. `left` names the hosts that may still be
+    running this run's job, which a sweep drawing from a pool must not
+    hand out again.
+    """
+
+    def __init__(self, left=()):
+        KeyboardInterrupt.__init__(self)
+        self.left = list(left)
 
 
 def fmt_secs(s):
@@ -1575,12 +1592,17 @@ def cmd_start(args, plan=None):
 
             if fleet.each(deploy, "deploying the job", quiet=True):
                 return 1
+        except KeyboardInterrupt:
+            raise _interrupted_arming(args, fleet, [])
         finally:
             if tarball:
                 os.unlink(tarball)
 
     if not args.no_skew_check and not fleet.dry_run:
-        rc = _report_skew(fleet, args)
+        try:
+            rc = _report_skew(fleet, args)
+        except KeyboardInterrupt:
+            raise _interrupted_arming(args, fleet, [])
         if rc:
             return rc
 
@@ -1592,21 +1614,22 @@ def cmd_start(args, plan=None):
            time.strftime("%H:%M:%S", time.localtime(at))))
 
     index = dict((h, i) for i, h in enumerate(plan.hosts))
+    begun = []          # every host whose arming has started
 
     def start(host):
+        begun.append(host)
         return fleet.sh(host, _start_script(fleet, plan, args, host, at,
                                             index[host], run_id))
 
-    failed = fleet.each(start, "arming agents", quiet=True)
+    try:
+        failed = fleet.each(start, "arming agents", quiet=True)
+    except KeyboardInterrupt:
+        raise _interrupted_arming(args, fleet,
+                                  [h for h in plan.hosts if h in begun])
     if failed:
         log("[tx] some hosts were not armed; the run would not be "
             "simultaneous, so it was not started on the rest either")
-        # Guarded like `tx stop`: a host refused at arming has nothing of
-        # this run's to stand down, and its pid file is not to be trusted.
-        fleet.each(lambda h: fleet.sh(h, _dir_guard(fleet)
-                                      + _kill_block(fleet.dir)
-                                      + STOP_TAIL),
-                   "standing the armed hosts back down", quiet=True)
+        _stand_down(fleet, plan.hosts)
         return 1
 
     late = time.time() - at
@@ -1620,6 +1643,59 @@ def cmd_start(args, plan=None):
     log("[tx]       tx collect     # bring the results back")
     log("[tx]       tx clean       # when you are done")
     return 0
+
+
+def _stand_down(fleet, hosts):
+    """Stop this run's agent on `hosts`, with Ctrl-C held off until that
+    is done. Returns the hosts it could not be stopped on.
+
+    A stand-down abandoned halfway leaves the partly armed fleet it exists
+    to prevent, so a Ctrl-C meanwhile is ignored rather than obeyed. (An
+    ssh started now inherits the ignoring, so a Ctrl-C at the terminal
+    does not cut its connection either.) Guarded like `tx stop`: a host
+    refused at arming has nothing of this run's to stand down, and its
+    pid file is not to be trusted.
+    """
+    script = _dir_guard(fleet) + _kill_block(fleet.dir) + STOP_TAIL
+    held = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        log("[tx] standing the armed hosts back down on %d hosts" % len(hosts))
+        results = fleet.gather(lambda h: fleet.sh(h, script), hosts)
+    finally:
+        signal.signal(signal.SIGINT, signal.default_int_handler
+                      if held is None else held)
+    fleet.report(hosts, results, quiet=True)
+    return [h for h in hosts if results[h][0] != 0]
+
+
+def _interrupted_arming(args, fleet, begun):
+    """Ctrl-C before the start was armed everywhere: stand down every host
+    it reached. Returns the Interrupted to raise.
+
+    A fleet armed on some hosts and not the rest runs the job on those
+    alone at the armed instant -- what a failed arming already refuses to
+    leave behind. Interrupted, tx used to exit with them armed (TX-005).
+
+    `begun` is every host whose arming had started, not only those that
+    answered "armed": at a terminal, Ctrl-C reaches the ssh in flight too,
+    and its host may have been armed before that ssh died without saying.
+    """
+    log("")
+    if not begun:
+        log("[tx] interrupted before any host was armed: nothing was started")
+        return Interrupted()
+    log("[tx] interrupted while arming, after reaching %d of %d host(s). A "
+        "run armed on only some of them would not be simultaneous, so they "
+        "are stood back down (Ctrl-C is ignored until that is done)"
+        % (len(begun), len(fleet.plan.hosts)))
+    left = _stand_down(fleet, begun)
+    if left:
+        log("[tx] %d host(s) could not be stood down, and may still run the "
+            "job on their own: %s" % (len(left), _hosts_line(left)))
+        _next_steps([("tx stop" + _fleet_flags(args), "stop it there")])
+    else:
+        log("[tx] stood back down: nothing of this start is running")
+    return Interrupted(left)
 
 
 def _report_skew(fleet, args):
@@ -1843,18 +1919,23 @@ def poll_interval(waited, pinned=None):
     return min(max(POLL_FLOOR, waited / 10.0), POLL_CEILING)
 
 
-def _wait_for_fleet(fleet, deadline, quiet=False, pinned=None):
+def _wait_for_fleet(fleet, deadline, quiet=False, pinned=None, seen=None):
     """Poll until every host has finished, or the deadline passes.
 
     Each poll is a fresh short ssh per host, closed as soon as it has
     answered -- nothing is held between polls, and the agents do not
     care whether anybody is watching. Killing this loop loses the
     waiting, not the run.
+
+    `seen`, a dict, is given each poll's answer as it comes ("states",
+    and "at" when): what a Ctrl-C in the middle of the wait reports.
     """
     last = None
     began = time.time()
     while True:
         states = _collect_status(fleet)
+        if seen is not None:
+            seen["states"], seen["at"] = states, time.time()
         done = sum(1 for h in fleet.plan.hosts if _is_finished(states[h]))
         if not quiet and done != last:
             log("[tx] %d/%d hosts finished" % (done, len(fleet.plan.hosts)))
@@ -2558,6 +2639,82 @@ def _wait_deadline(args, plan):
             + 60)
 
 
+# ---------------------------------------------------------------------------
+# Ctrl-C: what it leaves running, and what to type next (TX-005)
+# ---------------------------------------------------------------------------
+#
+# Once the hosts are armed, Ctrl-C stops tx and not the job. The agents are
+# detached by design: each finishes the job and keeps its results without
+# tx, and that is what lets `--resume` pick a sweep up. So tx leaves them
+# be and says what is still running and the next command for each choice.
+# Two moments are different. While arming, the hosts already reached are
+# stood back down (`_interrupted_arming`): a fleet armed on some hosts and
+# not the rest would run the job on those alone. And a --muster wave
+# finishes its bookkeeping with the pool first (`_muster_interrupted`).
+
+def _next_steps(steps):
+    """Print (command, what it is for) pairs, as `tx start` does its own.
+    The notes line up, except after a command too long to line up with:
+    a sweep's own command line would push every other note off the
+    screen."""
+    width = max([len(cmd) for cmd, _why in steps if len(cmd) <= 48] or [0])
+    for n, (cmd, why) in enumerate(steps):
+        log("[tx] %s %-*s  # %s" % ("next:" if n == 0 else "     ", width,
+                                    cmd, why))
+
+
+def _fleet_flags(args):
+    """What a follow-up command needs, as text, to reach the fleet this one
+    did: each fleet option given here that it would not pick up by itself,
+    from the environment or by default."""
+    words = []
+    if args.plan != _env("TX_PLAN", DEFAULT_PLAN):
+        words += ["--plan", args.plan]
+    if (getattr(args, "remote_dir", "") or "") != _env("TX_REMOTE_DIR", ""):
+        words += ["--remote-dir", args.remote_dir]
+    if (args.user or "") != _env("TX_USER", _env("SSH_USER", "")):
+        words += ["--user", args.user]
+    if (getattr(args, "allow_shared_remote_dir", False)
+            and _env("TX_ALLOW_SHARED_REMOTE_DIR", "") != "1"):
+        words.append("--allow-shared-remote-dir")
+    return "".join(" " + shlex.quote(w) for w in words)
+
+
+def _as_typed(args, extra=()):
+    """This command again, as it was typed, with `extra` on the end."""
+    words = list(getattr(args, "argv", None) or [args.cmd]) + list(extra)
+    return " ".join(["tx"] + [shlex.quote(w) for w in words])
+
+
+def _last_check(seen, hosts):
+    """Say which of `hosts` the wait's last status check found unfinished,
+    and return them. With no check back yet, that is all of them."""
+    states = seen.get("states")
+    if states is None:
+        log("[tx] no status check had come back yet, so all %d host(s) may "
+            "still be running: %s" % (len(hosts), _hosts_line(hosts)))
+        return list(hosts)
+    left = [h for h in hosts if h in states and not _is_finished(states[h])]
+    ago = fmt_secs(time.time() - seen["at"])
+    if left:
+        log("[tx] at the last check, %s ago, %d of %d host(s) had not "
+            "finished: %s" % (ago, len(left), len(hosts), _hosts_line(left)))
+    else:
+        log("[tx] at the last check, %s ago, every host had finished" % ago)
+    return left
+
+
+def _interrupted_run(headline, hosts, seen):
+    """Ctrl-C once `hosts` were armed: leave them as they are, and say which
+    were still running. Returns those."""
+    log("")
+    log(headline)
+    log("[tx] the hosts are left as they are: the agents are detached, so a "
+        "host still running finishes the job, and keeps its results, "
+        "without tx")
+    return _last_check(seen, hosts)
+
+
 def cmd_run(args):
     plan = load_plan(args.plan)
     if args.muster is not None:
@@ -2572,18 +2729,35 @@ def cmd_run(args):
     deadline = _wait_deadline(args, plan)
     log("[tx] waiting for the fleet (up to %s)"
         % fmt_secs(deadline - time.time()))
-    _states, finished = _wait_for_fleet(fleet, deadline, pinned=args.poll)
-    if not finished:
-        log("[tx] some hosts had not finished when the wait ran out; "
-            "collecting what there is")
-    summary = cmd_summarize(args, plan)
-    collected = cmd_collect(args, plan)
-    cleaned = 0
-    if args.clean:
-        args.yes = True
-        # A clean that was refused, or found an agent still going, is a
-        # host left as it was -- worth an exit code, not a silent zero.
-        cleaned = cmd_clean(args, plan)
+    seen = {}
+    try:
+        _states, finished = _wait_for_fleet(fleet, deadline,
+                                            pinned=args.poll, seen=seen)
+        if not finished:
+            log("[tx] some hosts had not finished when the wait ran out; "
+                "collecting what there is")
+        summary = cmd_summarize(args, plan)
+        collected = cmd_collect(args, plan)
+        cleaned = 0
+        if args.clean:
+            args.yes = True
+            # A clean that was refused, or found an agent still going, is a
+            # host left as it was -- worth an exit code, not a silent zero.
+            cleaned = cmd_clean(args, plan)
+    except KeyboardInterrupt:
+        left = _interrupted_run("[tx] interrupted", plan.hosts, seen)
+        flags = _fleet_flags(args)
+        steps = [("tx status" + flags, "who is running, who has finished"),
+                 ("tx collect" + flags + (" -d " + shlex.quote(args.dir)
+                                          if args.dir else ""),
+                  "bring the results back" + (", once they finish"
+                                              if left else ""))]
+        if left:
+            steps.append(("tx stop" + flags, "or stop the job now"))
+        if args.clean:
+            steps.append(("tx clean" + flags, "then remove what tx put there"))
+        _next_steps(steps)
+        raise Interrupted(left)
     return 1 if (summary or collected or cleaned or not finished) else 0
 
 
@@ -2710,6 +2884,42 @@ def _collect_wave(args, sub):
 
 
 def run_in_waves(args, plan):
+    """`_sweep`, and what a Ctrl-C in it leaves and says.
+
+    The wave running is left to finish, as in a whole-fleet run, and the
+    person is given the command that carries the sweep on: this one again,
+    with --resume and the -d the sweep collects into. Resume then waits
+    for that wave rather than starting it over.
+    """
+    given = bool(args.dir)
+    where = {}
+    try:
+        return _sweep(args, plan, where)
+    except KeyboardInterrupt as exc:
+        left = list(getattr(exc, "left", ()))
+        if not isinstance(exc, Interrupted):
+            if where.get("hosts"):
+                left = _interrupted_run(where["headline"], where["hosts"],
+                                        where["seen"])
+            else:
+                log("")
+                log("[tx] interrupted before the sweep had a wave running")
+        if not getattr(args, "sweep_id", ""):
+            log("[tx] the sweep had not begun, so there is nothing to "
+                "resume: run it again")
+            raise Interrupted(left)
+        steps = [(_as_typed(args, ([] if given else ["-d", args.dir])
+                            + ([] if args.resume else ["--resume"])),
+                  "carry the sweep on from where it stopped")]
+        if left:
+            flags = _fleet_flags(args)
+            steps += [("tx status" + flags, "who is running, who has finished"),
+                      ("tx stop" + flags, "or stop the wave now")]
+        _next_steps(steps)
+        raise Interrupted(left)
+
+
+def _sweep(args, plan, where):
     """Cover the whole fleet a few hosts at a time.
 
     Some jobs cannot run fleet-wide at once -- a licence with a seat
@@ -2810,9 +3020,12 @@ def run_in_waves(args, plan):
             log("[tx] waiting for the %d host(s) the interrupted sweep left "
                 "running rather than starting them over" % len(busy))
             sub = slice_plan(plan, busy)
+            where.update(hosts=busy, seen={}, headline="[tx] interrupted "
+                         "while waiting for the hosts the earlier sweep "
+                         "left running")
             busy_states, finished = _wait_for_fleet(
                 Fleet(sub, args), _wait_deadline(args, sub),
-                pinned=args.poll)
+                pinned=args.poll, seen=where["seen"])
             if not finished:
                 trouble.append(0)
             mine = [h for h in busy if _of_sweep(busy_states[h][1], sweep)]
@@ -2844,6 +3057,7 @@ def run_in_waves(args, plan):
             % (n, len(waves), " ".join(wave[:8])
                + (" ..." if len(wave) > 8 else "")))
         sub = slice_plan(plan, wave)
+        where.clear()
         if cmd_start(args, sub):
             # cmd_start has already stood this wave back down. The fleet
             # beyond it is untouched, so unless told otherwise carry on:
@@ -2857,8 +3071,11 @@ def run_in_waves(args, plan):
             continue
 
         deadline = _wait_deadline(args, sub)
+        where.update(hosts=wave, seen={}, headline="[tx] interrupted in "
+                     "wave %d of %d" % (n, len(waves)))
         wave_states, finished = _wait_for_fleet(Fleet(sub, args), deadline,
-                                                pinned=args.poll)
+                                                pinned=args.poll,
+                                                seen=where["seen"])
         # Recorded now, while the record is still on the hosts: the
         # collection below, and a --clean after it, are about to take it
         # away, and the final report is rendered from what we saw here.
@@ -3035,6 +3252,41 @@ def muster_lease(args, plan):
     return "%ds" % int(bound * 2 + 300)
 
 
+def _muster_interrupted(args, sub, wave, wave_states, collected):
+    """Ctrl-C in a --muster wave once it was armed: finish its bookkeeping.
+    Returns (wave_states, unclean) for the check-in that follows.
+
+    The pool is only as good as what tx tells it. Exiting on the spot left
+    every item of the wave held until its lease lapsed -- the finished ones
+    too -- and the pool then handed them out to be run again (TX-005). So
+    the wave is treated like one whose wait ran out: the fleet is asked
+    where each item got to (unless the wait had already finished), what has
+    a result is collected, and the check-in then marks it done, puts back
+    what never ran, and leaves only what is still running to its lease.
+
+    A second Ctrl-C abandons this, which is safe: everything still held
+    goes back when its lease lapses, as it always did.
+    """
+    log("")
+    log("[tx] interrupted in wave %d. Finishing its bookkeeping before "
+        "stopping: what ran is collected and checked in as done, what never "
+        "ran goes back to the pool, and only what is still running is left "
+        "to its lease (Ctrl-C again leaves the whole wave to its lease)"
+        % wave)
+    if wave_states is None:
+        wave_states = _collect_status(Fleet(sub, args))
+    unclean = False
+    if not collected:
+        ran = [h for h in sub.hosts if _has_result(wave_states[h])]
+        if ran:
+            part = slice_plan(sub, ran)
+            cmd_collect(args, part)
+            if args.clean:
+                args.yes = True
+                unclean = bool(cmd_clean(args, part))
+    return wave_states, unclean
+
+
 def run_from_muster(args, plan):
     """Cover a pool of work, X items at a time, checking each lot back in.
 
@@ -3072,6 +3324,8 @@ def run_from_muster(args, plan):
     log("[tx] drawing from the pool %s, %d at a time, lease %s -> %s/"
         % (args.muster, args.batch, lease, args.dir))
     wave = 0
+    stopped = False     # a Ctrl-C ended the sweep after this wave
+    leased = []         # items left still running, to their lease
     try:
         while True:
             _rc, _out = _muster(args, "take",
@@ -3122,7 +3376,21 @@ def run_from_muster(args, plan):
                 % (wave, len(fresh), " ".join(fresh[:8])
                    + (" ..." if len(fresh) > 8 else "")))
 
-            if cmd_start(args, sub):
+            try:
+                started = cmd_start(args, sub)
+            except Interrupted as exc:
+                # cmd_start stood the wave back down, or never armed it,
+                # and said so: nothing ran on its items, bar any host it
+                # could not stand down, whose item is left to its lease.
+                stopped = True
+                trouble.append(wave)
+                for item in fresh:
+                    states[item] = (False, None, "WAVE DID NOT START")
+                holding.append((head, [i for i in fresh
+                                       if i not in exc.left]))
+                leased.extend(exc.left)
+                break
+            if started:
                 # cmd_start has already stood this wave back down, so
                 # nothing ran on any of them. They go back unfinished:
                 # marking them done would report a benchmark that never
@@ -3137,28 +3405,41 @@ def run_from_muster(args, plan):
                     break
                 continue
 
-            deadline = _wait_deadline(args, sub)
-            wave_states, finished = _wait_for_fleet(
-                Fleet(sub, args), deadline, pinned=args.poll)
-            # Recorded now, while the record is still on the hosts: the
-            # collection below, and a --clean after it, are about to take
-            # it away.
-            states.update(wave_states)
-            if not finished:
-                log("[tx] wave %d had hosts still running when the wait ran "
-                    "out; collecting what there is" % wave)
-                trouble.append(wave)
-            if cmd_collect(args, sub):
-                trouble.append(wave)
+            wave_states = None
+            collected = False
             unclean = False
-            if args.clean:
-                args.yes = True
-                # Counted, and the sweep goes on unless --stop-on-fail:
-                # the items ran either way, and are checked in below by
-                # what ran, not by whether the host was tidied after.
-                unclean = bool(cmd_clean(args, sub))
-                if unclean:
+            try:
+                deadline = _wait_deadline(args, sub)
+                wave_states, finished = _wait_for_fleet(
+                    Fleet(sub, args), deadline, pinned=args.poll)
+                # Recorded now, while the record is still on the hosts: the
+                # collection below, and a --clean after it, are about to
+                # take it away.
+                states.update(wave_states)
+                if not finished:
+                    log("[tx] wave %d had hosts still running when the wait "
+                        "ran out; collecting what there is" % wave)
                     trouble.append(wave)
+                if cmd_collect(args, sub):
+                    trouble.append(wave)
+                collected = True
+                if args.clean:
+                    args.yes = True
+                    # Counted, and the sweep goes on unless --stop-on-fail:
+                    # the items ran either way, and are checked in below by
+                    # what ran, not by whether the host was tidied after.
+                    unclean = bool(cmd_clean(args, sub))
+                    if unclean:
+                        trouble.append(wave)
+            except KeyboardInterrupt:
+                # Ctrl-C: the wave is checked in below as if its wait had
+                # run out, and then the sweep stops.
+                stopped = True
+                trouble.append(wave)
+                wave_states, unclean = _muster_interrupted(
+                    args, sub, wave, wave_states, collected)
+                states.update(wave_states)
+                finished = False
 
             # The check-in, and the whole judgement in this mode, in
             # three parts:
@@ -3192,8 +3473,11 @@ def run_from_muster(args, plan):
             if working:
                 log("[tx] leaving %d item(s) still running to their lease "
                     "rather than handing them out again" % len(working))
+                leased.extend(working)
             if idle:
                 holding.append((head, idle))
+            if stopped:
+                break
             if args.stop_on_fail and (unclean or not finished):
                 log("[tx] --stop-on-fail: not taking any more from the pool")
                 break
@@ -3208,6 +3492,17 @@ def run_from_muster(args, plan):
             for head, items in holding:
                 if _check_in(args, handback, "release", head, items):
                     trouble.append(0)
+    except KeyboardInterrupt:
+        # Ctrl-C while tx talks to the pool, or a second one while a wave's
+        # bookkeeping is being finished: nothing more is done, and whatever
+        # this sweep still holds goes back when its lease lapses.
+        log("")
+        log("[tx] interrupted%s: the items this sweep still holds are left "
+            "to their lease (%s), and go back to the pool when it lapses"
+            % (" again" if stopped else "", lease))
+        _next_steps([(_as_typed(args), "carry on: the pool is the record "
+                      "of what is left")])
+        raise Interrupted()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3227,6 +3522,17 @@ def run_from_muster(args, plan):
     log("")
     _rc, out = _muster(args, "status", [], quiet=False)
     sys.stdout.write(out)
+    if stopped:
+        log("")
+        log("[tx] interrupted: the sweep stopped after wave %d" % wave)
+        if leased:
+            log("[tx] %d item(s) still running are left to their lease (%s): "
+                "nothing more is done with them here, and once it lapses the "
+                "pool hands them out again: %s"
+                % (len(leased), lease, _hosts_line(leased)))
+        _next_steps([(_as_typed(args), "carry on: the pool is the record "
+                      "of what is left")])
+        return 130
     return 1 if (rc or trouble) else 0
 
 
@@ -4320,8 +4626,13 @@ def main(argv=None):
     if getattr(args, "resume", False) and not getattr(args, "dir", ""):
         die("--resume picks up the sweep collecting into -d DIR, which "
             "holds that sweep's id: give the -d the sweep was started with")
+    # As typed, for the commands a Ctrl-C suggests running next.
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     try:
         return COMMANDS[args.cmd](args) or 0
+    except Interrupted:
+        # Already said what it left running and what to type next.
+        return 130
     except KeyboardInterrupt:
         log("")
         log("[tx] interrupted")

@@ -35,8 +35,8 @@ MUTATIONS=$(cat <<'TABLE'
 --- [ "$_tx_du" = "$_tx_id" ] || _tx_why=
 +++ true || _tx_why=
 ### t_a_planted_pid_in_a_refused_dir_is_never_signalled
----     script = _dir_guard(fleet) + _kill_block(fleet.dir) + STOP_TAIL
-+++     script = _kill_block(fleet.dir) + STOP_TAIL
+---     script = _dir_guard(fleet) + _kill_block(fleet.dir) + STOP_TAIL\n    failed = fleet.each(
++++     script = _kill_block(fleet.dir) + STOP_TAIL\n    failed = fleet.each(
 ### t_a_planted_pid_in_a_refused_dir_is_never_signalled
 ---     script = _dir_guard(fleet) + _clean_script(fleet.dir)
 +++     script = _clean_script(fleet.dir)
@@ -59,8 +59,8 @@ MUTATIONS=$(cat <<'TABLE'
 ---     return _dir_guard(fleet) + """
 +++     return """
 ### t_a_tx_py_swapped_after_the_copy_is_not_run
---- fleet.sh(h, _dir_guard(fleet)\n
-+++ fleet.sh(h, ""\n
+---     script = _dir_guard(fleet) + _kill_block(fleet.dir) + STOP_TAIL\n    held = signal.signal(
++++     script = _kill_block(fleet.dir) + STOP_TAIL\n    held = signal.signal(
 ### t_status_collect_logs_summarize_and_doctor_name_the_refusal
 ---     script = _dir_guard(fleet) + _status_script(fleet.dir)
 +++     script = _status_script(fleet.dir)
