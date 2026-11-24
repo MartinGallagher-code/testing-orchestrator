@@ -152,7 +152,8 @@ producing a staggered start:
 
 A host that cannot be armed does not leave the others running: the whole
 fleet is stood back down, because a run that began on 39 hosts of 40 is
-not the run you asked for.
+not the run you asked for. Ctrl-C in the middle of arming does the same
+(see [Pressing Ctrl-C](#pressing-ctrl-c)).
 
 ---
 
@@ -216,7 +217,8 @@ sequence it. If it doesn't — you closed the laptop, the ssh session
 dropped, somebody hit ^C — `--resume` picks it up from the fleet's own
 record and the sweep's collection. Nothing else is remembered here, so
 there is nothing to lose. Give it the same `-d` the sweep was started
-with: that directory holds the sweep's id.
+with: that directory holds the sweep's id. After a Ctrl-C, tx prints
+that command for you, as you typed it with `-d` and `--resume` added.
 
 ```bash
 tx run --batch 20 -d results --resume
@@ -332,6 +334,13 @@ keeps a copy of the other's record, so:
   are back in the pool without anything having to notice — no reaper, no
   cleanup, nothing local that was lost. That is why `--muster` and
   `--resume` do not go together: the pool is already the record.
+
+- **Ctrl-C is not a kill.** It finishes the wave's bookkeeping before
+  it stops: what ran is collected and checked in as done, what never ran
+  goes back to the pool, and only what is still running is left to its
+  lease. Without that, the wave's finished items would wait out the
+  lease too, and then be handed out and run again. A second Ctrl-C skips
+  the bookkeeping and leaves the whole wave to its lease.
 
 The pool decides *which* items and in what order; the plan stays the
 **address book**. An item the plan names is reached at the address the
@@ -798,6 +807,43 @@ the run whether `clean` can rule out a stray agent and whether a lost
 clean failed on any host. In a sweep the next wave still runs, unless
 `--stop-on-fail` makes that wave the last.
 
+## Pressing Ctrl-C
+
+Once the hosts are armed, Ctrl-C stops `tx` and not the job. The agents
+are detached: each host finishes the job and keeps its results without
+`tx`, and that is what lets `--resume` pick a sweep up. So `tx` leaves
+them running, names the hosts that had not finished at its last check,
+and gives the next command for each choice, with the options that reach
+this fleet:
+
+```text
+^C
+[tx] interrupted
+[tx] the hosts are left as they are: the agents are detached, so a host still running finishes the job, and keeps its results, without tx
+[tx] at the last check, 4.0s ago, 2 of 40 host(s) had not finished: web17 web31
+[tx] next: tx status --plan bench.ini   # who is running, who has finished
+[tx]       tx collect --plan bench.ini  # bring the results back, once they finish
+[tx]       tx stop --plan bench.ini     # or stop the job now
+```
+
+In a `--batch` sweep, the first of those is the command that carries the
+sweep on: the one you typed, with `-d` and `--resume`. Resume waits for
+the wave that was running rather than starting it over.
+
+Two moments are different:
+
+- **While arming**, the hosts already armed are stood back down before
+  `tx` exits, as after a failed arming: a fleet armed on some hosts and
+  not the rest would run the job on those alone. A second Ctrl-C is
+  ignored until that is done. Before any host is armed (the deploy, the
+  clock check), nothing was started, and `tx` says so.
+- **In a `--muster` wave**, the wave's bookkeeping with the pool is
+  finished first (*Drawing the work from a pool*, above).
+
+`tx stop` is how to stop the job instead. Ctrl-C does not stop it, unlike
+iperf's (which stops the hosts, IO-007): stopping would cost the
+sweep its `--resume`, and a long job its run.
+
 ## Exit status
 
 | Code | Meaning |
@@ -805,7 +851,7 @@ clean failed on any host. In a sweep the next wave still runs, unless
 | `0` | every host ran the job and exited zero, and everything came back |
 | `1` | a host failed, timed out, was never reachable, stopped mid-job without a result (`GONE`), or nothing was collected |
 | `2` | usage error |
-| `130` | interrupted (Ctrl-C). Agents already started are detached and keep running: `tx status` shows them, `tx collect` brings back what they made, `tx stop` stops them |
+| `130` | interrupted (Ctrl-C). Hosts already armed are left running, and `tx` names them and the next command: `tx status`, `tx collect`, `tx stop`, or the sweep's own command with `--resume`. Hosts caught mid-arming are stood back down first, and a `--muster` wave checks in what finished first. See [Pressing Ctrl-C](#pressing-ctrl-c) |
 
 ---
 

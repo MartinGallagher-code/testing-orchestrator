@@ -9,6 +9,59 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-11-24
+
+What Ctrl-C during `tx run` does to the hosts, and what it tells the
+person who pressed it (TX-005). It printed `[tx] interrupted` and exited
+130, whatever was going on: armed hosts went on to run the job alone, a
+`--muster` wave's finished items stayed held, and nothing said what was
+still running or what to type next.
+
+### Fixed
+
+- **Ctrl-C while arming stands the armed hosts back down.** With 1 of 4
+  hosts armed, tx exited and that host ran the job on its own at the
+  armed instant: the partly armed fleet a failed arming already refuses
+  to leave. Every host whose arming had begun (the ssh in flight
+  included: Ctrl-C at a terminal reaches it too) is now stood down as
+  after a failed arming, and a second Ctrl-C is ignored until that is
+  done. Before any host is armed (the deploy, the clock check) it says
+  that nothing was started.
+- **Ctrl-C in a `--muster` wave checks in what finished.** The wave's
+  items stayed held until their lease lapsed, the finished ones too, and
+  were then handed out and run again. The wave's bookkeeping is now
+  finished first, as for a wave whose wait ran out: what ran is collected
+  and checked in as done, what never ran goes back to the pool, and only
+  what is still running is left to its lease. The sweep then prints its
+  report and the pool's status, names what it left to the lease, and
+  exits 130. A second Ctrl-C leaves the whole wave to its lease, as any
+  Ctrl-C did before.
+- **Ctrl-C once the hosts are armed says what is still running, and what
+  to type next.** The job is still left running: the agents are detached,
+  and `--resume` depends on that. tx now names the hosts that had not
+  finished at the wait's last check, and gives `tx status`, `tx collect`
+  and `tx stop` with the `--plan` (and any other fleet option) needed to
+  reach the same fleet. A `--batch` sweep gives its own command again,
+  with `-d` and `--resume`, ready to paste.
+
+### Changed
+
+- The stand-down after a failed arming also ignores Ctrl-C until it is
+  done, for the same reason.
+
+### Tests
+
+- `tests/test_interrupt.sh`, new, with SIGINT sent to the python process
+  itself: in the wait, the job is left running, the message names the
+  hosts and the next commands, and `tx collect` as given brings the
+  results back; while arming, the armed hosts are stood down and nothing
+  runs at the instant, a second Ctrl-C included; a `--batch` sweep's
+  resume command, run as printed, finishes the sweep with every host run
+  once; a `--muster` wave checks in what finished (collected first),
+  puts back what never ran and leaves only the running item held; and
+  a `--muster` wave interrupted while arming puts all its items back.
+- `tests/test_mutations.sh`: each of those fixes, reverted, is caught.
+
 ## [1.3.0] - 2026-11-23
 
 A sweep's results are its own (TX-008). The fleet keeps no history: a

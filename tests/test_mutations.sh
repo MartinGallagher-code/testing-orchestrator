@@ -241,9 +241,9 @@ m_waves_ignore_their_clean() {
 }
 
 m_muster_ignores_its_clean() {
-    mutant '                unclean = bool(cmd_clean(args, sub))
-                if unclean:
-                    trouble.append(wave)' '                cmd_clean(args, sub)' \
+    mutant '                    unclean = bool(cmd_clean(args, sub))
+                    if unclean:
+                        trouble.append(wave)' '                    cmd_clean(args, sub)' \
         || return 1
     caught test_muster.sh "an uncleaned wave is counted"
 }
@@ -300,6 +300,61 @@ m_a_start_keeps_the_last_logs() {
     caught test_sweeps.sh "no-deploy collects only this run"
 }
 
+# ---- Ctrl-C during tx run (TX-005) ------------------------------------------
+
+m_the_wait_says_nothing() {
+    # The bug as it was: a bare "[tx] interrupted", naming nothing still
+    # running and no next command.
+    mutant '    except KeyboardInterrupt:
+        left = _interrupted_run("[tx] interrupted", plan.hosts, seen)' \
+           '    except ZeroDivisionError:
+        left = _interrupted_run("[tx] interrupted", plan.hosts, seen)' \
+        || return 1
+    caught test_interrupt.sh "in the wait, the job is left running"
+}
+
+m_an_interrupted_arming_is_left_armed() {
+    # The armed hosts are not stood down: they run the job alone.
+    mutant '    left = _stand_down(fleet, begun)' '    left = []' || return 1
+    caught test_interrupt.sh "while arming, the armed stand down" \
+                             "a terminal ctrl-c, ssh killed too" \
+                             "a muster wave arming puts items back"
+}
+
+m_a_second_ctrl_c_cuts_the_stand_down() {
+    mutant '    held = signal.signal(signal.SIGINT, signal.SIG_IGN)' \
+           '    held = signal.getsignal(signal.SIGINT)' || return 1
+    caught test_interrupt.sh "a second ctrl-c waits for the stand-down"
+}
+
+m_a_sweep_gives_no_resume() {
+    mutant '                            + ([] if args.resume else ["--resume"])),' \
+           '                            + []),' || return 1
+    caught test_interrupt.sh "a sweep says how to resume it"
+}
+
+m_a_muster_wave_is_left_to_its_lease() {
+    # The bug as it was: exit on the spot, every item still held.
+    mutant '                wave_states, unclean = _muster_interrupted(' \
+           '                raise; wave_states, unclean = _muster_interrupted(' \
+        || return 1
+    caught test_interrupt.sh "a muster wave checks in what finished"
+}
+
+m_a_muster_wave_is_checked_in_uncollected() {
+    mutant '            cmd_collect(args, part)' '            part = part' \
+        || return 1
+    caught test_interrupt.sh "a muster wave checks in what finished"
+}
+
+m_a_stood_down_muster_wave_stays_held() {
+    mutant '                holding.append((head, [i for i in fresh
+                                       if i not in exc.left]))' \
+           '                holding.append((head, [i for i in ()
+                                       if i not in exc.left]))' || return 1
+    caught test_interrupt.sh "a muster wave arming puts items back"
+}
+
 echo "mutations"
 run_test "stop waiting on any agent is caught"  m_stop_waits_on_any_agent
 run_test "trusting a live pid is caught"        m_a_live_pid_is_trusted
@@ -320,4 +375,11 @@ run_test "resume leaving hosts is caught"       m_resume_leaves_its_hosts
 run_test "an untold agent is caught"            m_the_agent_is_never_told_the_sweep
 run_test "a start keeping out/ is caught"       m_a_start_keeps_the_last_out
 run_test "a start keeping logs is caught"       m_a_start_keeps_the_last_logs
+run_test "a silent ctrl-c wait is caught"       m_the_wait_says_nothing
+run_test "an armed fleet left is caught"        m_an_interrupted_arming_is_left_armed
+run_test "a cut stand-down is caught"           m_a_second_ctrl_c_cuts_the_stand_down
+run_test "a sweep with no resume is caught"     m_a_sweep_gives_no_resume
+run_test "a muster wave left held is caught"    m_a_muster_wave_is_left_to_its_lease
+run_test "an uncollected check-in is caught"    m_a_muster_wave_is_checked_in_uncollected
+run_test "a stood-down wave held is caught"     m_a_stood_down_muster_wave_stays_held
 report_tests
