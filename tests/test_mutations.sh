@@ -355,6 +355,86 @@ m_a_stood_down_muster_wave_stays_held() {
     caught test_interrupt.sh "a muster wave arming puts items back"
 }
 
+# ---- status and export exit as the other fleet commands do (TX-006) -------
+
+m_status_exits_0_whatever_it_found() {
+    # The bug as it was: a report, so 0 whatever it found.
+    mutant '            break
+    return 1 if failed else 0' '            break
+    return 0' || return 1
+    caught test_fleet.sh "status reports the exit code" \
+        "status: unreachable host exits 1" "status: a GONE host exits 1" \
+        "status: timeout, setup exit 1" "readers name the refusal"
+    caught test_streams.sh "a host that never ran is reported"
+}
+
+m_status_fails_a_host_still_at_work() {
+    mutant '    # Still at work, unless nothing is left to do it: GONE.
+    return not alive' '    # Still at work, unless nothing is left to do it: GONE.
+    return True' || return 1
+    caught test_fleet.sh "status says what each host does"
+    caught test_agent.sh "a host tidying says so"
+}
+
+m_status_reads_gone_as_still_at_work() {
+    mutant '    # Still at work, unless nothing is left to do it: GONE.
+    return not alive' '    # Still at work, unless nothing is left to do it: GONE.
+    return False' || return 1
+    caught test_fleet.sh "status: a GONE host exits 1"
+}
+
+m_status_fails_a_fleet_with_nothing_yet() {
+    mutant '        return word not in STATUS_NOTHING_YET' \
+           '        return word is not None' || return 1
+    caught test_fleet.sh "status says what each host does"
+}
+
+m_status_reads_unreachable_as_nothing_yet() {
+    mutant 'STATUS_NOTHING_YET = ("NOT-DEPLOYED", "NOT-RUNNING", "NOT-STARTED-YET")' \
+           'STATUS_NOTHING_YET = ("NOT-DEPLOYED", "NOT-RUNNING", "NOT-STARTED-YET",
+                      "UNREACHABLE")' || return 1
+    caught test_fleet.sh "status: unreachable host exits 1"
+}
+
+m_status_fails_a_dry_run() {
+    mutant '        failed = not fleet.dry_run and any(' \
+           '        failed = any(' || return 1
+    caught test_fleet.sh "status says what each host does"
+}
+
+m_status_watch_exits_0() {
+    mutant '            # the last look at the fleet found.
+            break' '            # the last look at the fleet found.
+            return 0' || return 1
+    caught test_interrupt.sh "status --watch exits as it last saw"
+}
+
+m_status_watch_stops_on_a_failure() {
+    mutant '        if not args.watch:
+            break
+        try:
+            time.sleep(args.watch)' '        if not args.watch or failed:
+            break
+        try:
+            time.sleep(args.watch)' || return 1
+    caught test_interrupt.sh "status --watch exits as it last saw"
+}
+
+m_export_counts_samples_not_hosts() {
+    # The bug as it was: tx_state is always written, so this never fired.
+    mutant '    if not ran:
+        die("nothing to export' '    if not out.samples:
+        die("nothing to export' || return 1
+    caught test_export.sh "a live export with no record"
+}
+
+m_export_refuses_a_host_down() {
+    mutant '    if not ran:
+        die("nothing to export' '    if ran < len(hosts):
+        die("nothing to export' || return 1
+    caught test_export.sh "a live export with a host down"
+}
+
 echo "mutations"
 run_test "stop waiting on any agent is caught"  m_stop_waits_on_any_agent
 run_test "trusting a live pid is caught"        m_a_live_pid_is_trusted
@@ -382,4 +462,14 @@ run_test "a sweep with no resume is caught"     m_a_sweep_gives_no_resume
 run_test "a muster wave left held is caught"    m_a_muster_wave_is_left_to_its_lease
 run_test "an uncollected check-in is caught"    m_a_muster_wave_is_checked_in_uncollected
 run_test "a stood-down wave held is caught"     m_a_stood_down_muster_wave_stays_held
+run_test "status exiting 0 is caught"           m_status_exits_0_whatever_it_found
+run_test "status failing work is caught"        m_status_fails_a_host_still_at_work
+run_test "status missing GONE is caught"        m_status_reads_gone_as_still_at_work
+run_test "status failing nothing-yet is caught" m_status_fails_a_fleet_with_nothing_yet
+run_test "status passing unreachable is caught" m_status_reads_unreachable_as_nothing_yet
+run_test "status failing a dry run is caught"   m_status_fails_a_dry_run
+run_test "a watch exiting 0 is caught"          m_status_watch_exits_0
+run_test "a watch that stops is caught"         m_status_watch_stops_on_a_failure
+run_test "export counting samples is caught"    m_export_counts_samples_not_hosts
+run_test "export refusing a host down is caught" m_export_refuses_a_host_down
 report_tests

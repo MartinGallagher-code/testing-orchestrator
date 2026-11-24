@@ -9,6 +9,59 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-11-24
+
+`tx status` and a live `tx export` exit non-zero when a host failed, as
+every other fleet command already did (TX-006, found in TX-004's
+adversarial pass; iperf settled the same question in IO-008). A changed
+exit code is a major version under PUBLISHING.md: a script that ran
+`tx status` and ignored what it printed now sees a failure it was not
+told about before.
+
+### Changed
+
+- **`tx status` exits 1 when any host failed or could not be read**: a
+  line that is `FAILED`, `TIMEOUT`, `SETUP-FAILED`, `NEVER RAN` or
+  `GONE`, or a host it could not read (`UNREACHABLE`, a `REFUSED:`
+  `--remote-dir`, `NO-ANSWER`, an unreadable record). It exited 0
+  whatever it found. Hosts still `ARMED`, `RUNNING` or `TIDYING`, a pass,
+  and a host with nothing there yet (`NOT-DEPLOYED`, `NOT-RUNNING`)
+  still exit 0, and so does `--dry-run`. `--watch` keeps looping
+  whatever it finds, and when stopped with Ctrl-C exits with what its
+  last look found.
+- **A live `tx export` exits 1 when no host has a run record**, and
+  writes nothing (with `--append`, the file is left as it was). Its
+  `nothing to export` refusal could never fire: `tx_state` is written for
+  every host, record or not, so the samples were never empty, and a fleet
+  with no record anywhere exported its `NOT-RUN` and `UNREACHABLE` states
+  and exited 0. A host that is down while others have records is still
+  exported, as `UNREACHABLE`, and still exits 0.
+
+### Docs
+
+- README's *Exit status* says what `tx status` and `tx export` exit
+  with, and its `tx_state` row names `UNREACHABLE` and `NOT-RUN`.
+  `tx status --help` and `tx export --help` say the same.
+
+### Tests
+
+- `tests/test_fleet.sh`: status exits 1 for an unreachable host (before
+  and after it goes down, and with nothing ever deployed), a host gone
+  mid-job, a failed job, a timeout and a failed setup, and a refused
+  `--remote-dir` (where it was asserted to exit 0); and 0 with nothing
+  deployed, armed, running, passed, and under `--dry-run`.
+  `tests/test_streams.sh` (never ran) and `tests/test_agent.sh` (still
+  tidying: 0) gain the same check.
+- `tests/test_export.sh`: a live export with no record is refused, with
+  nothing deployed and with every host unreachable, and leaves an
+  `--append` file alone; one with a host down still exports, exit 0.
+- `tests/test_interrupt.sh`: `status --watch` keeps looking at a host
+  that is down, and exits with what its last look found.
+- `tests/test_mutations.sh`: each of those rules, taken back out of a
+  copy of `tx.py`, makes its test fail.
+- `host_down` in `tests/test_helper.bash` makes the fake ssh fail for a
+  host as an unreachable one does (exit 255).
+
 ## [1.3.1] - 2026-11-24
 
 What Ctrl-C during `tx run` does to the hosts, and what it tells the

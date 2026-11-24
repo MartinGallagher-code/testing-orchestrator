@@ -334,19 +334,33 @@ t_the_skew_check_can_be_skipped_entirely() {
 # ---- status ----------------------------------------------------------------
 
 t_status_says_what_each_host_is_doing() {
+    # None of these is a failure, so each exits 0: nothing deployed yet, a
+    # fleet still at work, and a fleet that passed (TX-006).
     install_fake_ssh
     plan="$(plan_for --run 'sleep 3' --timeout 30 -- web01 web02)"
     run_tx status --plan "$plan"
     assert_contains "$RUN_OUT" "NOT-DEPLOYED"
+    assert_status 0 "$RUN_RC" "status with nothing deployed"
+    # A dry run asks nobody, so it has nothing to fail on.
+    run_tx status --plan "$plan" --dry-run
+    assert_contains "$RUN_OUT" "DRY-RUN"
+    assert_status 0 "$RUN_RC" "status --dry-run"
 
     run_tx start --plan "$plan" --start-in 1 --no-skew-check
     assert_status 0 "$RUN_RC"
     run_tx status --plan "$plan"
     assert_contains "$RUN_OUT" "ARMED"
+    assert_status 0 "$RUN_RC" "status of an armed fleet"
 
     sleep 2
     run_tx status --plan "$plan"
     assert_contains "$RUN_OUT" "RUNNING"
+    assert_status 0 "$RUN_RC" "status of a fleet still running"
+
+    await_fleet "$plan" 2 || fail "the job never finished"
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "web02  DONE      exit 0"
+    assert_status 0 "$RUN_RC" "status of a fleet that passed"
 }
 
 t_status_reports_the_exit_code_of_a_finished_job() {
@@ -357,6 +371,69 @@ t_status_reports_the_exit_code_of_a_finished_job() {
     run_tx status --plan "$plan"
     assert_contains "$RUN_OUT" "FAILED"
     assert_contains "$RUN_OUT" "exit 7"
+    assert_status 1 "$RUN_RC" "status with a host that failed"
+}
+
+t_status_exits_1_when_a_host_is_unreachable() {
+    # It printed UNREACHABLE and exited 0, where every other fleet command
+    # exits 1 (TX-006).
+    install_fake_ssh
+    plan="$(plan_for --run true --timeout 30 -- web01 web02)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC"
+    await_fleet "$plan" 2 || fail "the job never finished"
+    run_tx status --plan "$plan"
+    assert_status 0 "$RUN_RC" "before: both hosts passed"
+
+    host_down web02
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "web01  DONE      exit 0"
+    assert_contains "$RUN_OUT" "web02  UNREACHABLE"
+    assert_status 1 "$RUN_RC" "after: one host unreachable"
+
+    # With nothing ever deployed, a host that cannot be reached is still
+    # one tx cannot read.
+    plan="$(plan_for --run true --timeout 30 -- web03 web04)"
+    host_down web03 web04
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "web03  UNREACHABLE"
+    assert_status 1 "$RUN_RC" "no host deployed, every host unreachable"
+}
+
+t_status_exits_1_for_a_host_gone_mid_job() {
+    # A record left saying "running" with no agent behind it: a reboot, an
+    # OOM kill. Nothing more is coming, so it is not a host still at work.
+    install_fake_ssh
+    plan="$(plan_for --run true --timeout 30 -- web01 web02)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 2 || fail "the job never finished"
+    d="$FAKE_ROOT/web01$TX_REMOTE_DIR"
+    sed -i 's/"state": "done"/"state": "running"/' "$d/run.json"
+    rm -f "$d/agent.pid"
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "web01  GONE"
+    assert_status 1 "$RUN_RC" "status with a host gone mid-job"
+}
+
+t_status_exits_1_for_a_timeout_or_a_failed_setup() {
+    install_fake_ssh
+    # web01's setup fails, so its job never runs; web02's job outlives its
+    # one-second limit.
+    plan="$(plan_for --run 'sleep 20' --setup '[ "$TX_HOST" != web01 ]' \
+            --timeout 1 -- web01 web02)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC"
+    local i=0
+    until grep -q '"state": "setup-failed"' "$FAKE_ROOT/web01$TX_REMOTE_DIR/run.json" 2>/dev/null \
+          && grep -q '"state": "timeout"' "$FAKE_ROOT/web02$TX_REMOTE_DIR/run.json" 2>/dev/null; do
+        i=$((i + 1))
+        [ "$i" -ge 150 ] && { fail "the hosts never finished"; return; }
+        sleep 0.2
+    done
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "web01  SETUP-FAILED"
+    assert_contains "$RUN_OUT" "web02  TIMEOUT"
+    assert_status 1 "$RUN_RC" "status with a failed setup and a timeout"
 }
 
 # ---- stop and clean --------------------------------------------------------
@@ -1117,7 +1194,7 @@ t_status_collect_logs_summarize_and_doctor_name_the_refusal() {
     a="$(host_dir web01)"
     chmod 0777 "$a"
     run_tx status --plan "$plan"
-    assert_status 0 "$RUN_RC" "status is a report, and still exits 0"
+    assert_status 1 "$RUN_RC" "status with a refused host, as summarize (TX-006)"
     assert_contains "$RUN_OUT" "web01  REFUSED: --remote-dir $a is owned by"
     assert_contains "$RUN_OUT" "web02  DONE"
     run_tx summarize --plan "$plan"
@@ -1212,6 +1289,9 @@ run_test "a skew you accept is accepted"       t_a_skew_you_have_decided_to_acce
 run_test "the skew check can be skipped"       t_the_skew_check_can_be_skipped_entirely
 run_test "status says what each host does"     t_status_says_what_each_host_is_doing
 run_test "status reports the exit code"        t_status_reports_the_exit_code_of_a_finished_job
+run_test "status: unreachable host exits 1"    t_status_exits_1_when_a_host_is_unreachable
+run_test "status: a GONE host exits 1"         t_status_exits_1_for_a_host_gone_mid_job
+run_test "status: timeout, setup exit 1"      t_status_exits_1_for_a_timeout_or_a_failed_setup
 run_test "stop keeps what the job made"        t_stop_ends_the_job_and_keeps_what_it_made
 run_test "stop takes the children too"         t_stop_takes_the_jobs_children_with_it
 run_test "clean leaves nothing behind"         t_clean_leaves_nothing_behind

@@ -222,6 +222,47 @@ t_exports_a_real_run_read_from_the_fleet() {
     done
 }
 
+t_a_live_export_with_a_host_down_still_exports() {
+    # A host that cannot be reached while the others have records is data
+    # for the floor plan, not a failed export: it stays exit 0 (TX-006).
+    install_fake_ssh
+    plan="$(plan_for --run true --tag live --timeout 30 -- a b c)"
+    run_tx run --plan "$plan" --start-in 1 --no-skew-check -d results --quiet
+    assert_status 0 "$RUN_RC"
+    host_down b
+    run_tx export --plan "$plan" -o out.tsv
+    assert_status 0 "$RUN_RC" "one host down, two with records"
+    out="$(cat out.tsv)"
+    assert_contains "$out" "2 host(s) with a record" "the header counts what ran"
+    assert_eq "PASSED" "$(sample "$out" tx_state a)" "a passed"
+    assert_eq "UNREACHABLE" "$(sample "$out" tx_state b)" "b is down"
+    assert_eq "PASSED" "$(sample "$out" tx_state c)" "c passed"
+}
+
+t_a_live_export_with_no_record_is_refused() {
+    # tx_state is written for every host, record or not, so the samples were
+    # never empty: a fleet with no record anywhere exported its NOT-RUN and
+    # UNREACHABLE states and exited 0, and the refusal never fired (TX-006).
+    install_fake_ssh
+    plan="$(plan_for --run true --tag live --timeout 30 -- a b)"
+    # Nothing deployed: every host is NOT-RUN.
+    run_tx export --plan "$plan" -o out.tsv
+    assert_status 1 "$RUN_RC" "no host deployed"
+    assert_contains "$RUN_OUT" "nothing to export -- none of the 2 host(s) has a run record"
+    assert_no_file out.tsv "nothing is written when there is nothing to export"
+    # --append leaves what is already there alone.
+    printf 'history\n' > hist.tsv
+    run_tx export --plan "$plan" -o hist.tsv --append
+    assert_status 1 "$RUN_RC" "no host deployed, --append"
+    assert_eq "history" "$(cat hist.tsv)" "the history was touched"
+    # Every host unreachable: the same.
+    host_down a b
+    run_tx export --plan "$plan"
+    assert_status 1 "$RUN_RC" "every host unreachable"
+    assert_contains "$RUN_OUT" "nothing to export"
+    assert_not_contains "$RUN_OUT" "tx_state" "a refused export wrote samples"
+}
+
 echo "export"
 run_test "declares a test line per overlay"    t_declares_a_test_line_and_files_every_overlay
 run_test "computes the record's numbers"       t_computes_the_numbers_the_record_holds
@@ -238,4 +279,6 @@ run_test "a run label with a space refused"    t_a_run_label_with_a_space_is_ref
 run_test "live export needs a plan"            t_live_export_without_a_plan_is_refused
 run_test "an empty collection is refused"      t_an_empty_collection_is_refused
 run_test "exports a real run from the fleet"   t_exports_a_real_run_read_from_the_fleet
+run_test "a live export with a host down"      t_a_live_export_with_a_host_down_still_exports
+run_test "a live export with no record"        t_a_live_export_with_no_record_is_refused
 report_tests

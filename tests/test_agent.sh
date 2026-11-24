@@ -201,6 +201,7 @@ t_a_host_running_its_teardown_says_so() {
     sleep 2.5
     run_tx status --plan "$plan"
     assert_contains "$RUN_OUT" "TIDYING"
+    assert_status 0 "$RUN_RC" "a host still tidying is not a failure (TX-006)"
 }
 
 t_a_teardown_that_failed_is_said_out_loud() {
