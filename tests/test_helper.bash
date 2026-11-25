@@ -101,6 +101,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 host="${target#*@}"
+# A host host_down named answers as an unreachable one does: ssh's own 255.
+if [ -f "$FAKE_ROOT/down.hosts" ] && grep -qxF -- "$host" "$FAKE_ROOT/down.hosts"; then
+    echo "ssh: connect to host $host port 22: No route to host" >&2
+    exit 255
+fi
 root="$FAKE_ROOT/$host"
 mkdir -p "$root"
 cmd="$*"
@@ -147,6 +152,16 @@ SHIM
     : > "$FAKE_ROOT/calls.log"
     export PATH="$FAKE_BIN:$PATH"
     export TX_REMOTE_DIR="${TX_REMOTE_DIR:-/var/tmp/tx-test}"
+}
+
+# host_down HOST... -- from now on the fake ssh cannot reach HOST: it exits
+# 255 with ssh's own message, and runs nothing there. Every other host is
+# untouched, and so is what HOST already holds.
+host_down() {
+    local h
+    for h in "$@"; do
+        printf '%s\n' "$h" >> "$FAKE_ROOT/down.hosts"
+    done
 }
 
 # skew_host HOST SECONDS -- make that host's clock wrong, so the skew

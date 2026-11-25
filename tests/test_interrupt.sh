@@ -297,6 +297,41 @@ t_while_a_muster_wave_arms_its_items_go_back() {
     done
 }
 
+# ---- tx status --watch -----------------------------------------------------
+
+# looked TEXT N -- the watch has printed TEXT on N lines or more: N looks.
+looked() { [ "$(grep -cF -- "$1" "$TEST_TMPDIR/bg.out")" -ge "$2" ]; }
+
+t_status_watch_exits_with_what_it_last_saw() {
+    # --watch goes on looking whatever it finds, and is stopped with Ctrl-C.
+    # It then exits with what its last look found (TX-006): it exited 0
+    # whatever it had seen.
+    install_fake_ssh
+    plan="$(plan_for --run true --tag w --timeout 30 -- a b)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    assert_status 0 "$RUN_RC"
+    local h
+    for h in a b; do
+        until_true 20 grep -q '"state": "done"' "$(remote "$h")/run.json" \
+            || fail "$h never finished"
+    done
+
+    tx_bg status --plan "$plan" --watch 1
+    until_true 20 looked "b  DONE" 2 || fail "the watch never looked twice"
+    kill -INT "$BG_PID"
+    finish_bg
+    assert_status 0 "$BG_RC" "every host passed at the last look"
+
+    # A host down: the watch keeps looking, and then exits 1.
+    host_down b
+    tx_bg status --plan "$plan" --watch 1
+    until_true 20 looked "b  UNREACHABLE" 2 \
+        || fail "the watch stopped after its first look at a host down"
+    kill -INT "$BG_PID"
+    finish_bg
+    assert_status 1 "$BG_RC" "a host down at the last look"
+}
+
 echo "interrupt"
 run_test "in the wait, the job is left running"   t_in_the_wait_the_job_is_left_running
 run_test "while arming, the armed stand down"     t_while_arming_the_armed_hosts_are_stood_down
@@ -305,4 +340,5 @@ run_test "a terminal ctrl-c, ssh killed too"      t_a_terminal_ctrl_c_stands_dow
 run_test "a sweep says how to resume it"          t_in_a_sweep_it_gives_the_command_that_resumes_it
 run_test "a muster wave checks in what finished"  t_in_a_muster_wave_what_finished_is_checked_in
 run_test "a muster wave arming puts items back"   t_while_a_muster_wave_arms_its_items_go_back
+run_test "status --watch exits as it last saw"   t_status_watch_exits_with_what_it_last_saw
 report_tests
