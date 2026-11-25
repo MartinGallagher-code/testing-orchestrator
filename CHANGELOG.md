@@ -50,9 +50,11 @@ the first drew a `CONFLICT` naming tx's own second lease.
 
 - `tests/test_muster.sh`: `down1 a b c d e f` with down1 unreachable,
   `--batch 1` and a 1s lease runs every reachable item and leaves down1
-  available; the same sweep puts down1 back once, with no `CONFLICT`; an
-  item still running when its lease lapses is not put back; a pool item
-  starting with `-` taken by name does not stop the sweep.
+  available; down1 is put back once, with no `CONFLICT`, in a sweep timed
+  so that its newer lease still holds it at the end (the double rounds a
+  lease down to whole seconds, so with 1s it could lapse first and hide
+  the bug); an item still running when its lease lapses is not put back;
+  a pool item starting with `-` taken by name does not stop the sweep.
 - `tests/test_mutations.sh`: a mutation for each fix, each caught by its
   test; the stood-down-wave mutation retargeted to the code it now names.
 

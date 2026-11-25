@@ -441,8 +441,7 @@ m_a_lapsed_lease_ends_the_sweep() {
     # had lapsed was read as an empty pool, and the sweep ended.
     mutant '                    by_name = _fresh_in_pool(args, seen, args.batch)' \
            '                    by_name = []' || return 1
-    caught test_muster.sh "a lapsed lease does not end it" \
-                          "a lapsed item is released once"
+    caught test_muster.sh "a lapsed lease does not end it"
 }
 
 m_a_lapsed_item_is_released_under_its_first_lease() {

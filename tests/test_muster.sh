@@ -440,17 +440,25 @@ t_a_lapsed_item_is_released_once_under_its_own_lease() {
     # the release under the first lease drew a CONFLICT naming tx's own
     # second one. It is one item, released once, under the lease it is
     # held by now.
+    #
+    # The timing is the test. The double truncates a lease to whole
+    # seconds, so a 2s lease lasts between 1s and 2s. a's wave, armed 3s
+    # ahead, always outlasts down1's first lease; and with nothing after
+    # a, the sweep ends a fraction of a second after taking down1 back,
+    # inside its new lease. Released under the old one, it would draw the
+    # CONFLICT -- with a 1s lease the new one could lapse first, and the
+    # old release then went through and hid the bug.
     install_fake_ssh
     install_fake_muster
     host_down down1
-    pool="$(make_pool down1 a b c)"
-    plan="$(sweep_plan down1 a b c)"
-    run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease 1s \
-        --start-in 1 --no-skew-check -d results --quiet
+    pool="$(make_pool down1 a)"
+    plan="$(sweep_plan down1 a)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease 2s \
+        --start-in 3 --no-skew-check -d results --quiet
     assert_contains "$RUN_OUT" "came back with a lapsed lease"
     assert_contains "$RUN_OUT" "putting 1 item(s) back"
     assert_not_contains "$RUN_OUT" "CONFLICT"
-    assert_eq "pool.csv,4,3,0,1,75.00,0" \
+    assert_eq "pool.csv,2,1,0,1,50.00,0" \
         "$(muster status --pool "$pool" --csv | tail -1)"
 }
 
