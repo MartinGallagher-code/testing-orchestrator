@@ -202,6 +202,25 @@ rack should not cost the other nine their coverage. `--stop-on-fail`
 stops instead, and the hosts nobody got to are reported as `NOT REACHED`
 rather than quietly counted as passes.
 
+**A failed wave is one with anything in it that makes the sweep exit 1:**
+
+- **a host in it failed:** its job exited non-zero, timed out, failed its
+  setup or could not start, it stopped mid-job (`GONE`), or the host gave
+  no result at all;
+- **or the wave itself did:** it could not start, its wait ran out with
+  a host still running or no longer answering, its collection did not
+  all come back (a host that could not be collected from, an `OVERSIZE`
+  file left behind), or its `--clean` failed.
+
+One failed host is enough, however many passed beside it. A teardown that
+failed is not a failed wave: the report warns about it (`TEARDOWN`), and
+it does not change the exit status either. `tx` says which wave stopped
+the sweep, and why:
+
+```text
+[tx] --stop-on-fail: wave 1 failed (1 exited non-zero), so not starting the remaining waves
+```
+
 **Every sweep has an id**, made when it begins: the time, and a few
 random characters. It is written into the collection directory, as
 `.tx-sweep`, before the first wave is armed. Every host's run record
@@ -319,6 +338,12 @@ is **done** — a job that ran and failed is a measurement, not an item to
 hand to the next worker to fail identically — and one nothing reached is
 **released** for somebody else. Then it asks for more, until the pool has
 nothing left to give it.
+
+`--stop-on-fail` stops taking from the pool after a failed wave, read the
+same way as with `--batch` (*Coverage*, above): any host in it failed, or
+the wave could not start, finish, be collected or be cleaned. That wave's
+items are still checked in by what ran, so a job that ran and failed is
+done; what the sweep never took stays in the pool for the next worker.
 
 The division of labour is the whole point. **muster owns what is
 outstanding; tx owns what happens to the items it is holding.** Neither

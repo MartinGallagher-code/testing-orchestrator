@@ -9,6 +9,52 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-11-25
+
+What `--stop-on-fail` counts as a failed wave (TX-007, found by TX-004's
+adversarial pass). `--help` said "stop after a failed wave", but a job of
+`exit 3` on every host, with `tx run --batch 1 --stop-on-fail`, ran all
+three waves: the sweep stopped only when a wave could not start, ran out
+its wait, or could not be cleaned. The same held for `--muster`. The code
+now does what `--help` said, so this is a fix, and the exit codes do not
+change.
+
+### Fixed
+
+- **`--stop-on-fail` stops after any wave that makes the sweep exit 1.**
+  A host in it failed (its job exited non-zero, timed out, failed its
+  setup or could not start, it stopped mid-job, or it gave no result), or
+  the wave itself did (it could not start, its wait ran out, its
+  collection did not all come back, or its `--clean` failed). The
+  collection was not counted before, either. One failed host is enough.
+  A teardown that failed still does not stop the sweep, as it does not
+  change the exit status. Both `--batch` and `--muster`.
+- **It says why.** `[tx] --stop-on-fail: wave 1 failed (1 exited non-zero),
+  so not starting the remaining waves`, where it used to say only that it
+  was stopping.
+- What the report counts as a failed host, and what a wave counts, are
+  now one list in the code, so the exit status and `--stop-on-fail`
+  cannot come to disagree.
+
+### Documentation
+
+- `--help`, `tx hints` and README (*Coverage* and *Drawing the work from
+  a pool*) say what a failed wave is.
+
+### Tests
+
+- `tests/test_waves.sh`: `--stop-on-fail` stops after one wave for a job
+  that exits non-zero (on every host, and on one host of a wave), times
+  out, fails its setup, cannot start, or loses its agent mid-job, and for
+  a wave whose wait runs out or whose collection fails; it goes on past a
+  failed teardown.
+- `tests/test_muster.sh`: a failed job stops the sweep taking from the
+  pool, and leaves what was not taken available; a failed teardown does
+  not.
+- `tests/test_mutations.sh`: a mutation for each kind of failure, each
+  caught by its test, and one that makes a teardown count, caught by the
+  test that says it does not.
+
 ## [2.0.1] - 2026-11-25
 
 What a `--muster` sweep does when one of its leases lapses under it
