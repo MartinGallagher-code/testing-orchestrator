@@ -9,6 +9,56 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-11-25
+
+A `--muster` sweep now warns when an explicit `--lease` is shorter than one
+wave can take (TX-011, option (b) of TX-009). A lease that lapses mid-wave
+lets another worker take the item and deploy onto the same host while tx
+is still working there, and muster said so only afterwards, at the
+check-in.
+
+### Changed
+
+- **A short `--lease` is warned about, once, before the first take.** One
+  wave can take the arming window, the job's timeout, the timeout again
+  for setup and for teardown (each with its kill grace), and the minute tx
+  waits on top. A `--lease` shorter than that prints one `WARNING` naming
+  the lease, how long a wave can take, a whole-minute lease that covers
+  it, and the lease tx would set if `--lease` were left out. It is a
+  warning only: the sweep, its results and its exit status are as they
+  were. With no `--lease` nothing changes, since tx's own lease is twice
+  the wave and five minutes more.
+- tx now reads a lease the way binnacle's `muster` does
+  (`parse_duration`: `90`, `45m`, `2h`, `1h30m`, `1.5h`; units s, m, h,
+  d). A lease it cannot read gets no warning, and muster's own refusal
+  (`bad duration`) still stops the sweep before anything runs.
+
+### Documentation
+
+- README, *Drawing the work from a pool*: the warning, with an example,
+  and that the lease it suggests covers the wait but not collecting and
+  cleaning; the default lease is twice the wave's bound *and five minutes
+  more*. The `muster_lease` docstring says an explicit lease is warned
+  about, not refused.
+
+### Tests
+
+- `tests/test_muster.sh`: a short lease warns exactly once over three
+  waves, before the first, and the sweep's exit status, pool, collection
+  and account are the same as without `--lease`; `2m`, `1h30m` and a
+  lease a hair over the wave do not warn, and neither does no `--lease`;
+  the reader agrees with binnacle's `parse_duration` on 26 forms (and is
+  put to the real one where binnacle is installed), and a lease exactly
+  the wave's length is enough; a lease tx cannot read (`5x`) gets no
+  warning and muster's refusal stops the sweep. The muster double now
+  reads durations by binnacle's rules and refuses a bad one with exit 2,
+  as muster does.
+- `tests/test_mutations.sh`: removing the warning, and turning its
+  comparison around, are each caught.
+- `tests/test_adversarial_mutations.sh`: the mutation that drops setup and
+  teardown from a `--muster` wave's bound follows that line into
+  `_muster_wave_bound`, which the lease and the warning now share.
+
 ## [2.0.1] - 2026-11-25
 
 What a `--muster` sweep does when one of its leases lapses under it

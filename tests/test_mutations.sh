@@ -468,6 +468,23 @@ m_an_item_by_name_is_an_option() {
     caught test_muster.sh "an item by name can start with -"
 }
 
+# ---- a --lease shorter than one wave (TX-011) -------------------------------
+
+m_a_short_lease_is_not_warned_about() {
+    # The warning taken back out: the sweep is as it was before TX-011.
+    mutant '    short = muster_lease_warning(args, plan)' \
+           '    short = None' || return 1
+    caught test_muster.sh "a short lease warns once"
+}
+
+m_the_lease_comparison_is_turned_around() {
+    # Warns about a lease that covers the wave, and not one that does not.
+    mutant '    if given >= wave:' \
+           '    if given < wave:' || return 1
+    caught test_muster.sh "a short lease warns once" \
+        "a long enough lease does not warn" "the lease reads as muster reads it"
+}
+
 echo "mutations"
 run_test "stop waiting on any agent is caught"  m_stop_waits_on_any_agent
 run_test "trusting a live pid is caught"        m_a_live_pid_is_trusted
@@ -509,4 +526,6 @@ run_test "a lapsed lease ending it is caught"  m_a_lapsed_lease_ends_the_sweep
 run_test "a release under the old lease caught" m_a_lapsed_item_is_released_under_its_first_lease
 run_test "a running item put back is caught"   m_a_running_item_is_put_back
 run_test "an item read as an option is caught" m_an_item_by_name_is_an_option
+run_test "a short lease unwarned is caught"   m_a_short_lease_is_not_warned_about
+run_test "a lease compared backwards caught" m_the_lease_comparison_is_turned_around
 report_tests

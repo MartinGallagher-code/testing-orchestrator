@@ -36,8 +36,8 @@ MUTATIONS=$(cat <<'TABLE'
 ---     extra = (1 if plan.setup else 0) + (1 if plan.teardown else 0)
 +++     extra = 0
 ### t_the_wait_and_the_lease_count_setup_and_teardown
----     bound = _job_bound(plan, args.batch, args.start_in) + 60
-+++     bound = plan.timeout + arm_delay(args.batch, args.start_in) + 60
+---     return _job_bound(plan, args.batch, args.start_in) + 60
++++     return plan.timeout + arm_delay(args.batch, args.start_in) + 60
 ### t_the_wait_and_the_lease_count_setup_and_teardown
 ---     return (time.time() + _job_bound(plan, len(plan.hosts), args.start_in)
 +++     return (time.time() + plan.timeout + arm_delay(len(plan.hosts), args.start_in)
