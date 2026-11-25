@@ -54,6 +54,9 @@ change.
 - `tests/test_mutations.sh`: a mutation for each kind of failure, each
   caught by its test, and one that makes a teardown count, caught by the
   test that says it does not.
+- `tests/test_adversarial_mutations.sh`: the mutation that takes `GONE`
+  out of the exit status now names its entry in the one list, where the
+  line it used to name no longer exists.
 
 ## [2.0.1] - 2026-11-25
 
