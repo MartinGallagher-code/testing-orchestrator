@@ -518,6 +518,40 @@ t_a_pool_item_taken_by_name_can_start_with_a_dash() {
     assert_contains "$pool" "b,done"
 }
 
+# ---- what --stop-on-fail counts as a failed wave (TX-007) --------------------
+
+t_stop_on_fail_stops_taking_after_a_failed_job() {
+    # A job that ran and failed is still checked in done -- it is a
+    # measurement -- but its wave failed, so no more is taken from the pool.
+    install_fake_ssh
+    install_fake_muster
+    pool="$(make_pool a b c)"
+    plan="$(plan_for --run 'exit 3' --tag pool --timeout 30 -- a b c)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --start-in 1 \
+        --no-skew-check -d results --stop-on-fail --quiet
+    assert_status 1 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--stop-on-fail: wave 1 failed (1 exited non-zero)"
+    assert_contains "$RUN_OUT" "not taking any more from the pool"
+    assert_not_contains "$RUN_OUT" "=== wave 2" "the sweep should have stopped"
+    # a ran, so it is done; b and c were never taken, and wait in the pool.
+    assert_eq "pool.csv,3,1,0,2,33.33,0" \
+        "$(muster status --pool "$pool" --csv | tail -1)"
+}
+
+t_stop_on_fail_goes_on_past_a_failed_teardown_in_a_pool() {
+    install_fake_ssh
+    install_fake_muster
+    pool="$(make_pool a b c)"
+    plan="$(plan_for --run 'echo "$TX_HOST" > "$TX_OUT/who"' \
+            --teardown 'exit 5' --tag pool --timeout 30 -- a b c)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --start-in 1 \
+        --no-skew-check -d results --stop-on-fail --quiet
+    assert_status 0 "$RUN_RC"
+    assert_not_contains "$RUN_OUT" "--stop-on-fail:"
+    assert_eq "pool.csv,3,3,0,0,100.00,0" \
+        "$(muster status --pool "$pool" --csv | tail -1)"
+}
+
 # ---- the flag's own guardrails --------------------------------------------
 
 t_muster_needs_a_batch_size() {
@@ -554,6 +588,8 @@ run_test "a lapsed lease does not end it"      t_a_lapsed_lease_does_not_end_the
 run_test "a lapsed item is released once"      t_a_lapsed_item_is_released_once_under_its_own_lease
 run_test "a running item stays left"           t_an_item_still_running_stays_left_to_its_lease
 run_test "an item by name can start with -"    t_a_pool_item_taken_by_name_can_start_with_a_dash
+run_test "stop-on-fail: a failed job"          t_stop_on_fail_stops_taking_after_a_failed_job
+run_test "stop-on-fail: not a teardown"        t_stop_on_fail_goes_on_past_a_failed_teardown_in_a_pool
 run_test "muster needs a batch size"           t_muster_needs_a_batch_size
 run_test "muster and resume are exclusive"     t_muster_and_resume_do_not_go_together
 run_test "a lease without a pool is refused"   t_a_lease_without_a_pool_is_refused

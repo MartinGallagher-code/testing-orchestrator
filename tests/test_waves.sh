@@ -227,6 +227,151 @@ t_stop_on_fail_stops_at_a_wave_that_cannot_be_cleaned() {
     assert_no_file "results/sweep~c~out~who" "the sweep should have stopped"
 }
 
+# ---- what --stop-on-fail counts as a failed wave (TX-007) --------------------
+#
+# Any wave that makes the sweep exit 1: a host that failed in any of the
+# report's ways, or a wave that could not start, ran out its wait, or could
+# not be collected or cleaned. Each kind has its own test, and the one thing
+# the report warns about without failing the run -- a teardown that failed --
+# has one of its own that shows it does not stop the sweep.
+
+# stopped_after_wave_one WHY [COVERED] -- the sweep of a, b and c, a wave
+# of one each, stopped after a's wave for WHY, and b and c were never
+# reached. COVERED (default 1) is how many hosts left a run record.
+stopped_after_wave_one() {
+    assert_status 1 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--stop-on-fail: wave 1 failed ($1)"
+    assert_contains "$RUN_OUT" "not starting the remaining waves"
+    assert_not_contains "$RUN_OUT" "wave 2 of 3" "the sweep should have stopped"
+    assert_contains "$RUN_OUT" "NOT REACHED"
+    assert_contains "$RUN_OUT" "covered ${2:-1} of 3 hosts"
+}
+
+t_stop_on_fail_stops_when_every_job_fails() {
+    # The ticket's own case: exit 3 on every host ran all three waves.
+    install_fake_ssh
+    plan="$(plan_for --run 'exit 3' --tag t --timeout 30 -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    stopped_after_wave_one "1 exited non-zero"
+}
+
+t_stop_on_fail_stops_when_one_job_in_the_wave_fails() {
+    # One host's failure fails its wave, however many passed beside it.
+    install_fake_ssh
+    plan="$(plan_for --run 'test "$TX_HOST" != b' --tag t --timeout 30 \
+            -- a b c d e f)"
+    run_tx run --plan "$plan" --batch 2 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    assert_status 1 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--stop-on-fail: wave 1 failed (1 exited non-zero)"
+    assert_contains "$RUN_OUT" "covered 2 of 6 hosts"
+    assert_no_file "results/t~c~run.json" "the sweep should have stopped"
+}
+
+t_stop_on_fail_stops_at_a_timeout() {
+    install_fake_ssh
+    plan="$(plan_for --run 'sleep 20' --tag t --timeout 2 -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    stopped_after_wave_one "1 timed out"
+}
+
+t_stop_on_fail_stops_at_a_failed_setup() {
+    install_fake_ssh
+    plan="$(plan_for --setup 'exit 4' --run 'true' --tag t --timeout 30 \
+            -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    stopped_after_wave_one "1 failed setup"
+}
+
+t_stop_on_fail_stops_at_a_job_that_could_not_start() {
+    # No payload holds nowhere.txt, so the job cannot be given its stdin.
+    install_fake_ssh
+    plan="$(plan_for --run 'cat' --stdin nowhere.txt --tag t --timeout 30 \
+            -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    stopped_after_wave_one "1 could not start the job"
+}
+
+t_stop_on_fail_stops_at_a_host_gone_mid_job() {
+    # The job kills its own agent, so the record says running and nothing
+    # is left to finish it: GONE.
+    install_fake_ssh
+    plan="$(plan_for --run 'kill -9 $PPID; sleep 1' --tag t --timeout 30 \
+            -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    stopped_after_wave_one "1 stopped mid-job"
+}
+
+# run_tx_waiting_4s ARGS... -- run_tx, with each wave's wait cut to 4s.
+run_tx_waiting_4s() {
+    RUN_OUT="$(python3 - "$(dirname "$TX")" "$@" 2>&1 <<'PY'
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import tx
+tx._wait_deadline = lambda args, plan: time.time() + 4
+sys.exit(tx.main(sys.argv[2:]))
+PY
+)"
+    RUN_RC=$?
+}
+
+t_stop_on_fail_stops_when_the_wait_runs_out() {
+    # a is still working when its wait runs out.
+    install_fake_ssh
+    plan="$(plan_for --run 'sleep 8' --tag t --timeout 30 -- a b c)"
+    run_tx_waiting_4s run --plan "$plan" --batch 1 --start-in 1 \
+        --no-skew-check -d results --stop-on-fail --quiet
+    stopped_after_wave_one "its wait ran out"
+}
+
+t_stop_on_fail_stops_at_a_host_that_gives_no_result() {
+    # The job takes its own host off the network, so nothing more is heard
+    # from it: no result, a wait that runs out and nothing to collect. The
+    # host comes first, as the report lists it.
+    install_fake_ssh
+    plan="$(plan_for --run 'echo "$TX_HOST" >> "$FAKE_ROOT/down.hosts"' \
+            --tag t --timeout 30 -- a b c)"
+    run_tx_waiting_4s run --plan "$plan" --batch 1 --start-in 1 \
+        --no-skew-check -d results --stop-on-fail --quiet
+    assert_contains "$RUN_OUT" "UNREACHABLE"
+    stopped_after_wave_one \
+        "1 gave no result; its wait ran out; the collection did not all come back" 0
+}
+
+t_stop_on_fail_stops_when_the_collection_fails() {
+    # A file over --max-bytes is left on the host, and the collection says
+    # so and fails; the job itself passed.
+    install_fake_ssh
+    plan="$(plan_for --run 'head -c 50000 /dev/zero > "$TX_OUT/big"' \
+            --tag t --timeout 30 -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --max-bytes 20000 --stop-on-fail --quiet
+    assert_contains "$RUN_OUT" "OVERSIZE"
+    stopped_after_wave_one "the collection did not all come back"
+}
+
+t_stop_on_fail_goes_on_past_a_failed_teardown() {
+    # The report warns about a teardown that failed, and the run still
+    # exits 0: it is not a failed wave, so the sweep goes on.
+    install_fake_ssh
+    plan="$(plan_for --run 'echo "$TX_HOST" > "$TX_OUT/who"' \
+            --teardown 'exit 5' --tag sweep --timeout 30 -- a b c)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --stop-on-fail --quiet
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "TEARDOWN"
+    assert_not_contains "$RUN_OUT" "--stop-on-fail:"
+    assert_contains "$RUN_OUT" "covered 3 of 3 hosts"
+    for h in a b c; do
+        assert_file_exists "results/sweep~$h~out~who" "$h was never run"
+    done
+}
+
 # ---- resume: the fleet is the record ----------------------------------------
 
 # Start a sweep in the background and return the ORCHESTRATOR's pid.
@@ -399,6 +544,16 @@ run_test "stop-on-fail names the unreached"    t_stop_on_fail_stops_and_says_who
 run_test "a wave that cannot start is named"   t_a_wave_that_cannot_start_is_named_not_skipped_silently
 run_test "an uncleaned wave is counted"        t_a_wave_that_cannot_be_cleaned_is_counted
 run_test "stop-on-fail stops at an unclean"    t_stop_on_fail_stops_at_a_wave_that_cannot_be_cleaned
+run_test "stop-on-fail: every job fails"       t_stop_on_fail_stops_when_every_job_fails
+run_test "stop-on-fail: one job fails"         t_stop_on_fail_stops_when_one_job_in_the_wave_fails
+run_test "stop-on-fail: a timeout"             t_stop_on_fail_stops_at_a_timeout
+run_test "stop-on-fail: a failed setup"        t_stop_on_fail_stops_at_a_failed_setup
+run_test "stop-on-fail: a job that never ran"  t_stop_on_fail_stops_at_a_job_that_could_not_start
+run_test "stop-on-fail: a host gone mid-job"   t_stop_on_fail_stops_at_a_host_gone_mid_job
+run_test "stop-on-fail: the wait runs out"     t_stop_on_fail_stops_when_the_wait_runs_out
+run_test "stop-on-fail: a host with no result" t_stop_on_fail_stops_at_a_host_that_gives_no_result
+run_test "stop-on-fail: a failed collection"   t_stop_on_fail_stops_when_the_collection_fails
+run_test "stop-on-fail: not a teardown"        t_stop_on_fail_goes_on_past_a_failed_teardown
 run_test "a killed sweep is resumed"           t_a_killed_sweep_is_resumed_from_the_fleets_own_record
 run_test "resume waits for live work"          t_resume_waits_for_hosts_still_running_rather_than_restarting_them
 run_test "resuming a finished sweep"           t_resuming_a_finished_sweep_does_nothing

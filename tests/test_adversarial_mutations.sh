@@ -27,8 +27,8 @@ MUTATIONS=$(cat <<'TABLE'
 ---         if not alive and report.get("state") in UNFINISHED:
 +++         if False:
 ### t_run_fails_when_an_agent_dies_mid_job
----                      or gone) else 1
-+++                      ) else 1
+---     ("gone", "stopped mid-job"),
++++     # ("gone", "stopped mid-job"),
 ### t_an_earlier_runs_record_does_not_answer_for_this_one
 --- rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}
 +++ : rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log}

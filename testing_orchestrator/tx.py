@@ -85,7 +85,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -2318,17 +2318,34 @@ def cmd_summarize(args, plan=None):
     return render_summary(plan, _collect_status(fleet), args)
 
 
-def render_summary(plan, states, args, waves=0):
-    """The report, from states already gathered.
+# What makes a host a failure, by the report's own lists (_sort_hosts), in
+# the order it prints them, and how a wave that stops a sweep names each.
+# tx's exit status is 1 when any of them holds a host, and --stop-on-fail
+# stops after a wave in which any of them does (TX-007): both read this
+# one list, so they cannot come to disagree. A teardown that failed is not
+# here: the report warns about it, and the run still passes.
+FAILURE_KINDS = (
+    ("setup_bad", "failed setup"),
+    ("never", "could not start the job"),
+    ("failed", "exited non-zero"),
+    ("timed", "timed out"),
+    ("gone", "stopped mid-job"),
+    ("missing", "gave no result"),
+)
 
-    Kept separate from the polling because coverage mode cannot poll at
-    the end: by then the earlier waves have been collected and possibly
-    cleaned, and a host that was wiped an hour ago would read as one that
-    never answered. So a wave records what it saw while it could, and
-    this renders the lot.
+
+def _sort_hosts(hosts, states):
+    """The hosts' states, sorted into the lists the report is made of.
+
+    A dict of lists. `missing` holds (host, why) for a host with no run
+    record and `gone` (host, record) for one that stopped mid-job; every
+    other list holds run records: `reports` (all of them), `passed`,
+    `failed`, `timed`, `setup_bad`, `never`, `unfinished` and
+    `teardown_bad`. render_summary prints them; _failures says which of
+    them fail a run, or a wave.
     """
     reports, missing, gone = [], [], []
-    for host in plan.hosts:
+    for host in hosts:
         alive, report, word = states[host]
         if report is None:
             missing.append((host, word or "no result"))
@@ -2340,17 +2357,81 @@ def render_summary(plan, states, args, waves=0):
         # it was reported as, with an exit status of 0.
         if not alive and report.get("state") in UNFINISHED:
             gone.append((host, report))
-
-    passed = [r for r in reports if r.get("exit") == 0
-              and not r.get("timed_out")]
-    failed = [r for r in reports if r.get("exit") not in (0, None)
-              and not r.get("timed_out")]
-    timed = [r for r in reports if r.get("timed_out")]
-    setup_bad = [r for r in reports if r.get("state") == "setup-failed"]
-    never = [r for r in reports if r.get("state") == "launch-failed"]
     gone_ids = set(id(r) for _h, r in gone)
-    unfinished = [r for r in reports if r.get("state") in UNFINISHED
-                  and id(r) not in gone_ids]
+    return {
+        "reports": reports,
+        "missing": missing,
+        "gone": gone,
+        "passed": [r for r in reports if r.get("exit") == 0
+                   and not r.get("timed_out")],
+        "failed": [r for r in reports if r.get("exit") not in (0, None)
+                   and not r.get("timed_out")],
+        "timed": [r for r in reports if r.get("timed_out")],
+        "setup_bad": [r for r in reports
+                      if r.get("state") == "setup-failed"],
+        "never": [r for r in reports if r.get("state") == "launch-failed"],
+        "unfinished": [r for r in reports if r.get("state") in UNFINISHED
+                       and id(r) not in gone_ids],
+        "teardown_bad": [r for r in reports
+                         if r.get("teardown_exit") not in (0, None)],
+    }
+
+
+def _failures(sorted_hosts):
+    """What failed among sorted hosts, as "N exited non-zero" phrases.
+
+    In FAILURE_KINDS' order, and empty when nothing did: the run passes
+    exactly when this is empty.
+    """
+    return ["%d %s" % (len(sorted_hosts[key]), what)
+            for key, what in FAILURE_KINDS if sorted_hosts[key]]
+
+
+def _wave_failed(hosts, states, finished=True, uncollected=False,
+                 unclean=False):
+    """Why a wave counts as failed, as phrases; empty when it does not.
+
+    What --stop-on-fail stops after (TX-007): anything in the wave that
+    makes the sweep exit 1. A host that failed in any of the report's
+    ways (FAILURE_KINDS), however many passed beside it, and the wave's
+    own steps after it started: a wait that ran out before every host
+    had a result, a collection that did not all come back, a --clean
+    that failed. A wave that could not start is stopped on where that happens,
+    since there is nothing more of it to read.
+
+    It once stopped only on those steps, so a sweep whose every job
+    exited 3 ran to its last wave, while `--help` said "stop after a
+    failed wave".
+    """
+    why = _failures(_sort_hosts(hosts, states))
+    if not finished:
+        why.append("its wait ran out")
+    if uncollected:
+        why.append("the collection did not all come back")
+    if unclean:
+        why.append("its clean failed")
+    return why
+
+
+def _stop_on_fail(wave, why, what):
+    log("[tx] --stop-on-fail: wave %d failed (%s), so %s"
+        % (wave, "; ".join(why), what))
+
+
+def render_summary(plan, states, args, waves=0):
+    """The report, from states already gathered.
+
+    Kept separate from the polling because coverage mode cannot poll at
+    the end: by then the earlier waves have been collected and possibly
+    cleaned, and a host that was wiped an hour ago would read as one that
+    never answered. So a wave records what it saw while it could, and
+    this renders the lot.
+    """
+    s = _sort_hosts(plan.hosts, states)
+    reports, missing, gone = s["reports"], s["missing"], s["gone"]
+    passed, failed, timed = s["passed"], s["failed"], s["timed"]
+    setup_bad, never = s["setup_bad"], s["never"]
+    unfinished, teardown_bad = s["unfinished"], s["teardown_bad"]
 
     log("")
     log("tx -- %s   [%s]" % (plan.run, plan.tag))
@@ -2452,23 +2533,20 @@ def render_summary(plan, states, args, waves=0):
         for host, why in missing[:args.top]:
             log("            %-16s %s" % (host, why))
 
-    teardown_bad = [r for r in reports
-                    if r.get("teardown_exit") not in (0, None)]
     if teardown_bad:
         log("  TEARDOWN  %d host(s) failed to clean up after themselves: %s"
             % (len(teardown_bad),
                " ".join(r["host"] for r in teardown_bad[:8])))
         log("            those hosts may not be as you found them.")
 
+    failures = _failures(s)
     log("")
-    if not (failed or timed or missing or setup_bad or unfinished or never
-            or gone):
+    if not (failures or unfinished):
         log("[tx] every host ran the job and exited zero.")
     if not waves:
         log("[tx] next: tx collect     # the results themselves")
         log("[tx]       tx clean       # remove every trace")
-    return 0 if not (failed or timed or missing or setup_bad or never
-                     or gone) else 1
+    return 1 if failures else 0
 
 
 # ---------------------------------------------------------------------------
@@ -3109,7 +3187,8 @@ def _sweep(args, plan, where):
             for host in wave:
                 states[host] = (False, None, "WAVE DID NOT START")
             if args.stop_on_fail:
-                log("[tx] --stop-on-fail: not starting the remaining waves")
+                _stop_on_fail(n, ["it could not start"],
+                              "not starting the remaining waves")
                 break
             continue
 
@@ -3128,7 +3207,8 @@ def _sweep(args, plan, where):
                 "out; collecting what there is" % n)
             trouble.append(n)
 
-        if cmd_collect(args, sub):
+        uncollected = bool(cmd_collect(args, sub))
+        if uncollected:
             trouble.append(n)
         unclean = False
         if args.clean:
@@ -3139,9 +3219,12 @@ def _sweep(args, plan, where):
             unclean = bool(cmd_clean(args, sub))
             if unclean:
                 trouble.append(n)
-        if args.stop_on_fail and (unclean or not finished):
-            log("[tx] --stop-on-fail: not starting the remaining waves")
-            break
+        if args.stop_on_fail:
+            why = _wave_failed(wave, wave_states, finished, uncollected,
+                               unclean)
+            if why:
+                _stop_on_fail(n, why, "not starting the remaining waves")
+                break
 
     # A sweep stopped early leaves hosts nobody ever asked. Saying so is
     # the difference between "they passed" and "they were never run".
@@ -3511,13 +3594,14 @@ def run_from_muster(args, plan):
                     states[item] = (False, None, "WAVE DID NOT START")
                 hold(head, fresh)
                 if args.stop_on_fail:
-                    log("[tx] --stop-on-fail: not taking any more from the "
-                        "pool")
+                    _stop_on_fail(wave, ["it could not start"],
+                                  "not taking any more from the pool")
                     break
                 continue
 
             wave_states = None
             collected = False
+            uncollected = False
             unclean = False
             try:
                 deadline = _wait_deadline(args, sub)
@@ -3531,7 +3615,8 @@ def run_from_muster(args, plan):
                     log("[tx] wave %d had hosts still running when the wait "
                         "ran out; collecting what there is" % wave)
                     trouble.append(wave)
-                if cmd_collect(args, sub):
+                uncollected = bool(cmd_collect(args, sub))
+                if uncollected:
                     trouble.append(wave)
                 collected = True
                 if args.clean:
@@ -3589,9 +3674,16 @@ def run_from_muster(args, plan):
                 hold(head, idle)
             if stopped:
                 break
-            if args.stop_on_fail and (unclean or not finished):
-                log("[tx] --stop-on-fail: not taking any more from the pool")
-                break
+            if args.stop_on_fail:
+                # Checked in first, by what ran: a failed wave's items are
+                # done or released like any other's, and only the taking
+                # stops.
+                why = _wave_failed(fresh, states, finished, uncollected,
+                                   unclean)
+                if why:
+                    _stop_on_fail(wave, why,
+                                  "not taking any more from the pool")
+                    break
 
         # Everything that was leased and never measured, put back in one
         # go now that no further take can pick it up again: each item
@@ -4343,7 +4435,10 @@ HINTS = [
      "a licence seat count, a filer, a power envelope: --batch covers the "
      "whole fleet a few hosts at a time, each wave armed for its own "
      "instant, everything landing in one directory. It is not --jobs, "
-     "which is only how many ssh connections are open."),
+     "which is only how many ssh connections are open. --stop-on-fail "
+     "ends the sweep after a failed wave: any host in it that failed, "
+     "timed out or gave no result, or a wave that could not start, finish, "
+     "be collected or be cleaned."),
     ("draw the work from a shared pool, once each, across many machines",
      "muster add 'web[01-40]' && tx run --muster --batch 10 -d results",
      "tx run --muster patching.csv --batch 10 --lease 2h -d results",
@@ -4603,7 +4698,10 @@ def build_parser():
                    help="seconds between status checks (default: 2 "
                         "backing off to 30)")
     r.add_argument("--stop-on-fail", action="store_true",
-                   help="with --batch, stop after a failed wave")
+                   help="with --batch or --muster, stop after a failed "
+                        "wave: one with any host that failed, timed out or "
+                        "gave no result, or that could not start, finish, "
+                        "be collected or be cleaned")
 
     ex = sub.add_parser(
         "export", help="write results for the layout viewer",

@@ -468,6 +468,82 @@ m_an_item_by_name_is_an_option() {
     caught test_muster.sh "an item by name can start with -"
 }
 
+# ---- what --stop-on-fail counts as a failed wave (TX-007) -----------------
+
+m_waves_stop_only_on_their_own_steps() {
+    # The bug as it was: no host's result counted, only the wave's steps.
+    mutant '            why = _wave_failed(wave, wave_states, finished, uncollected,' \
+           '            why = _wave_failed([], {}, finished, uncollected,' \
+        || return 1
+    caught test_waves.sh "stop-on-fail: every job fails" \
+                         "stop-on-fail: one job fails"
+}
+
+m_muster_stops_only_on_its_own_steps() {
+    mutant '                why = _wave_failed(fresh, states, finished, uncollected,' \
+           '                why = _wave_failed([], {}, finished, uncollected,' \
+        || return 1
+    caught test_muster.sh "stop-on-fail: a failed job"
+}
+
+# kind_not_counted LINE LABEL -- FAILURE_KINDS without LINE: neither the
+# run nor a wave fails on that kind any more, so LABEL's sweep goes on.
+kind_not_counted() {
+    mutant "$1"$'\n' "" || return 1
+    caught test_waves.sh "$2"
+}
+
+m_a_failed_job_is_not_counted() {
+    kind_not_counted '    ("failed", "exited non-zero"),' \
+                     "stop-on-fail: every job fails"
+}
+
+m_a_timeout_is_not_counted() {
+    kind_not_counted '    ("timed", "timed out"),' "stop-on-fail: a timeout"
+}
+
+m_a_failed_setup_is_not_counted() {
+    kind_not_counted '    ("setup_bad", "failed setup"),' \
+                     "stop-on-fail: a failed setup"
+}
+
+m_a_job_that_never_ran_is_not_counted() {
+    kind_not_counted '    ("never", "could not start the job"),' \
+                     "stop-on-fail: a job that never ran"
+}
+
+m_a_host_gone_is_not_counted() {
+    kind_not_counted '    ("gone", "stopped mid-job"),' \
+                     "stop-on-fail: a host gone mid-job"
+}
+
+m_a_host_with_no_result_is_not_counted() {
+    kind_not_counted '    ("missing", "gave no result"),' \
+                     "stop-on-fail: a host with no result"
+}
+
+m_a_wait_that_ran_out_is_not_counted() {
+    mutant '    if not finished:
+        why.append(' '    if False:
+        why.append(' || return 1
+    caught test_waves.sh "stop-on-fail: the wait runs out"
+}
+
+m_a_failed_collection_is_not_counted() {
+    mutant '    if uncollected:
+        why.append(' '    if False:
+        why.append(' || return 1
+    caught test_waves.sh "stop-on-fail: a failed collection"
+}
+
+m_a_failed_teardown_is_counted() {
+    # The one thing it does not stop on, made to count.
+    mutant '    ("missing", "gave no result"),' '    ("missing", "gave no result"),
+    ("teardown_bad", "failed teardown"),' || return 1
+    caught test_waves.sh "stop-on-fail: not a teardown"
+    caught test_muster.sh "stop-on-fail: not a teardown"
+}
+
 echo "mutations"
 run_test "stop waiting on any agent is caught"  m_stop_waits_on_any_agent
 run_test "trusting a live pid is caught"        m_a_live_pid_is_trusted
@@ -509,4 +585,15 @@ run_test "a lapsed lease ending it is caught"  m_a_lapsed_lease_ends_the_sweep
 run_test "a release under the old lease caught" m_a_lapsed_item_is_released_under_its_first_lease
 run_test "a running item put back is caught"   m_a_running_item_is_put_back
 run_test "an item read as an option is caught" m_an_item_by_name_is_an_option
+run_test "waves ignoring hosts is caught"       m_waves_stop_only_on_their_own_steps
+run_test "muster ignoring hosts is caught"      m_muster_stops_only_on_its_own_steps
+run_test "an uncounted failed job is caught"    m_a_failed_job_is_not_counted
+run_test "an uncounted timeout is caught"       m_a_timeout_is_not_counted
+run_test "an uncounted setup is caught"         m_a_failed_setup_is_not_counted
+run_test "an uncounted never-ran is caught"     m_a_job_that_never_ran_is_not_counted
+run_test "an uncounted GONE is caught"          m_a_host_gone_is_not_counted
+run_test "an uncounted no-result is caught"     m_a_host_with_no_result_is_not_counted
+run_test "an uncounted wait is caught"          m_a_wait_that_ran_out_is_not_counted
+run_test "an uncounted collection is caught"    m_a_failed_collection_is_not_counted
+run_test "a counted teardown is caught"         m_a_failed_teardown_is_counted
 report_tests
