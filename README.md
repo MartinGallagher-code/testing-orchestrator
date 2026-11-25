@@ -87,7 +87,7 @@ agents to install, no packages, no root. Key-based SSH must already work
 |---|---|
 | `tx gen` | Build `plan.ini` from your server list. |
 | `tx start` | Copy the job to every host and arm them all for one instant. |
-| `tx status` | One line per host: `ARMED`, `RUNNING`, `TIDYING`, `DONE exit 0`, `TIMEOUT`. |
+| `tx status` | One line per host: `ARMED`, `RUNNING`, `TIDYING`, `DONE exit 0`, `TIMEOUT`. Exits 1 if any host failed or could not be read. |
 | `tx collect` | Bring the results back into one directory, named by host. |
 | `tx summarize` | Who passed, who failed, who was slow — and how tight the start was. |
 | `tx clean` | Stop, then delete what tx put there — and nothing else: anything it did not put there stops it, by name. It says "no trace" only if it could check. |
@@ -641,7 +641,7 @@ One sample per host:
 | `tx_exit` | the job's exit code |
 | `tx_setup_exit` `tx_teardown_exit` | the setup and teardown exit codes, when they ran |
 | `tx_timed_out` | 1 if the host hit the timeout, 0 if not |
-| `tx_state` | `PASSED`, `FAILED`, `TIMEOUT`, `SETUP-FAILED`, `NEVER-RAN`, `RUNNING`, and `NO-DATA` for a host in the plan that never reported |
+| `tx_state` | `PASSED`, `FAILED`, `TIMEOUT`, `SETUP-FAILED`, `NEVER-RAN`, `RUNNING`; for a host with no record, `UNREACHABLE`, `NOT-RUN` (never deployed or never started), or `NO-DATA` for a host in the plan that never reported |
 
 **Reading a runtime without knowing the hardware.** `tx_rel_median` puts
 every host against the fleet's own median, on a diverging ramp where 100% is
@@ -869,9 +869,25 @@ sweep its `--resume`, and a long job its run.
 | Code | Meaning |
 |---|---|
 | `0` | every host ran the job and exited zero, and everything came back |
-| `1` | a host failed, timed out, was never reachable, stopped mid-job without a result (`GONE`), or nothing was collected |
+| `1` | a host failed, timed out, was never reachable, stopped mid-job without a result (`GONE`), or nothing was collected; for `tx export`, no host has a run record |
 | `2` | usage error |
 | `130` | interrupted (Ctrl-C). Hosts already armed are left running, and `tx` names them and the next command: `tx status`, `tx collect`, `tx stop`, or the sweep's own command with `--resume`. Hosts caught mid-arming are stood back down first, and a `--muster` wave checks in what finished first. See [Pressing Ctrl-C](#pressing-ctrl-c) |
+
+Every fleet command reads a failed host the same way, `tx status`
+included. It prints a line per host, and exits 1 when any line is
+`FAILED`, `TIMEOUT`, `SETUP-FAILED`, `NEVER RAN` or `GONE`, or names a
+host it could not read (`UNREACHABLE`, a `REFUSED:` line, `NO-ANSWER`).
+Hosts that are only `ARMED`, `RUNNING` or `TIDYING`, done with `exit 0`,
+or have nothing there yet (`NOT-DEPLOYED`, `NOT-RUNNING`) leave it at 0,
+so a fleet still at work is not a failure. `--watch` keeps looping
+whatever it finds; stopped with Ctrl-C between looks, it exits with what
+the last look found (130 if the Ctrl-C lands while it is asking).
+
+`tx export` exits 1 when no host has a run record, and writes nothing. A
+host that is down while others have records does not change its exit: it
+is exported with its state (`UNREACHABLE`), which is data for the floor
+plan, not a failed export. `tx export --from` exits 1 on a collection
+with no records, as before.
 
 ---
 

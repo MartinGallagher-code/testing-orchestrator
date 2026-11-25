@@ -406,31 +406,7 @@ t_the_pools_own_status_is_printed_at_the_end() {
     assert_contains "$RUN_OUT" "3 of 3 done"
 }
 
-# ---- the flag's own guardrails --------------------------------------------
-
 # ---- a lease that lapses mid-sweep (TX-009) --------------------------------
-
-# down_host NAME -- ssh and scp to NAME fail the way an unreachable host's
-# do (exit 255), so no wave holding it can start. Everything else still
-# goes through the fake fleet.
-down_host() {
-    local tool
-    for tool in ssh scp; do
-        [ -f "$FAKE_BIN/$tool.up" ] || mv "$FAKE_BIN/$tool" "$FAKE_BIN/$tool.up"
-        cat > "$FAKE_BIN/$tool" <<SHIM
-#!/usr/bin/env bash
-for a in "\$@"; do
-    case "\$a" in
-        $1|*@$1|$1:*|*@$1:*)
-            echo "$tool: connect to host $1 port 22: Connection refused" >&2
-            exit 255 ;;
-    esac
-done
-exec "\$FAKE_BIN/$tool.up" "\$@"
-SHIM
-        chmod +x "$FAKE_BIN/$tool"
-    done
-}
 
 t_a_lapsed_lease_does_not_end_the_sweep() {
     # TX-004's adversarial pass, suspect 3. down1 cannot start, so it is
@@ -441,7 +417,7 @@ t_a_lapsed_lease_does_not_end_the_sweep() {
     # what this sweep has already seen is not an empty pool.
     install_fake_ssh
     install_fake_muster
-    down_host down1
+    host_down down1
     pool="$(make_pool down1 a b c d e f)"
     plan="$(sweep_plan down1 a b c d e f)"
     run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease 1s \
@@ -466,7 +442,7 @@ t_a_lapsed_item_is_released_once_under_its_own_lease() {
     # held by now.
     install_fake_ssh
     install_fake_muster
-    down_host down1
+    host_down down1
     pool="$(make_pool down1 a b c)"
     plan="$(sweep_plan down1 a b c)"
     run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease 1s \
@@ -517,7 +493,7 @@ t_a_pool_item_taken_by_name_can_start_with_a_dash() {
     # stopped the sweep. It is taken as --item=NAME, refused and put back.
     install_fake_ssh
     install_fake_muster
-    down_host down1
+    host_down down1
     printf '%s\n' 'item,state,holder,lease_id,taken_ts,expires_ts,done_ts,attempts,note' \
         'down1,available,,,,,,0,' 'a,available,,,,,,0,' \
         '-oProxyCommand=true,available,,,,,,0,' 'b,available,,,,,,0,' \
@@ -533,6 +509,8 @@ t_a_pool_item_taken_by_name_can_start_with_a_dash() {
     assert_contains "$pool" "a,done"
     assert_contains "$pool" "b,done"
 }
+
+# ---- the flag's own guardrails --------------------------------------------
 
 t_muster_needs_a_batch_size() {
     install_fake_muster

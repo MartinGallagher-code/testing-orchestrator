@@ -151,6 +151,7 @@ t_a_host_that_never_ran_is_reported_as_such() {
     sleep 2.5
     run_tx status --plan "$plan"
     assert_contains "$RUN_OUT" "NEVER RAN"
+    assert_status 1 "$RUN_RC" "status with hosts that never ran (TX-006)"
 
     run_tx summarize --plan "$plan"
     assert_status 1 "$RUN_RC" "a fleet that never ran is not a pass"

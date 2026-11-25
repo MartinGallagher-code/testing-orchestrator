@@ -85,7 +85,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.3.2"
+VERSION = "2.0.1"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -1153,14 +1153,22 @@ def _run_agent(args, workdir):
             # "running" for a host that was doing nothing at all, and put
             # the only explanation in the agent's log where `tx collect`
             # could not see it. It is a result, so it is recorded as one.
+            #
+            # What it said goes to stderr first, and the record is written
+            # once, whole: whatever reads launch-failed -- tx status, tx
+            # collect, a test -- finds the reason already there. Written
+            # the other way round, a record read between the two writes
+            # said launch-failed with an empty stderr and no stderr_tail.
+            try:
+                ferr.write(("tx agent: the job would not start: %s\n"
+                            % exc).encode("utf-8"))
+                ferr.flush()
+            except (OSError, IOError):
+                pass  # the record still says why, in its detail
             report["state"] = "launch-failed"
             report["detail"] = str(exc)
             report["finished_at"] = time.time()
             report["duration"] = report["finished_at"] - started
-            _write_json(REPORT_NAME, report)
-            ferr.write(("tx agent: the job would not start: %s\n"
-                        % exc).encode("utf-8"))
-            ferr.flush()
             report["stderr_tail"] = _tail_text(STDERR_NAME)
             _write_json(REPORT_NAME, report)
             return 1
@@ -1873,9 +1881,37 @@ def _is_finished(entry):
     return not alive
 
 
+# What a host with no run record can say and still not have failed: tx was
+# never run there, or was deployed and never started, or its agent is up
+# and about to write its record. Any other word -- UNREACHABLE, a REFUSED
+# --remote-dir, NO-ANSWER, UNREADABLE-REPORT -- is a host tx cannot read.
+STATUS_NOTHING_YET = ("NOT-DEPLOYED", "NOT-RUNNING", "NOT-STARTED-YET")
+
+
+def _status_failed(entry):
+    """Does this host's `tx status` line say something went wrong?
+
+    The same reading as _state_line, line for line: FAILED, TIMEOUT,
+    SETUP-FAILED, NEVER RAN and GONE, and a host that could not be read.
+    A host still at work is not a failure, and nor is a pass.
+    """
+    alive, report, word = entry
+    if report is None:
+        return word not in STATUS_NOTHING_YET
+    state = report.get("state")
+    if state == "done" or state == "timeout":
+        return bool(report.get("timed_out")) or report.get("exit") != 0
+    if state in FINISHED:
+        # setup-failed, launch-failed: the job never ran.
+        return True
+    # Still at work, unless nothing is left to do it: GONE.
+    return not alive
+
+
 def cmd_status(args):
     plan = load_plan(args.plan)
     fleet = Fleet(plan, args)
+    failed = False
     while True:
         if args.watch:
             sys.stdout.write("\033[2J\033[H")
@@ -1885,15 +1921,21 @@ def cmd_status(args):
         width = max(len(h) for h in plan.hosts)
         for host in plan.hosts:
             log("  %-*s  %s" % (width, host, _state_line(*states[host])))
+        # Exit 1 as every other fleet command does when a host failed or
+        # could not be read (TX-006): a script reads status's exit, not its
+        # lines. Hosts still running are not a failure. A --dry-run asked
+        # nobody, so it has nothing to fail on.
+        failed = not fleet.dry_run and any(
+            _status_failed(states[h]) for h in plan.hosts)
         if not args.watch:
             break
         try:
             time.sleep(args.watch)
         except KeyboardInterrupt:
+            # --watch is stopped with Ctrl-C; what it exits with is what
+            # the last look at the fleet found.
             break
-    # A report, so it exits 0 whatever it found -- an unreachable host or a
-    # refused --remote-dir included, each named on its own line.
-    return 0
+    return 1 if failed else 0
 
 
 POLL_FLOOR = 2.0
@@ -3995,9 +4037,14 @@ def cmd_export(args):
         if report.get("state") in ("done", "timeout"):
             out.add("timed_out", host, 1.0 if report.get("timed_out") else 0.0)
 
-    if not out.samples:
-        die("nothing to export -- no host has a run record yet (tx status)",
-            code=1)
+    # Counted by host, not by sample: tx_state is written for every host,
+    # record or not, so the samples are never empty and this refusal could
+    # never fire -- a fleet with no record anywhere exported its NOT-RUN and
+    # UNREACHABLE states and exited 0 (TX-006). A host that is down while
+    # others have records is still exported, its state as data, and exit 0.
+    if not ran:
+        die("nothing to export -- none of the %d host(s) has a run record "
+            "yet (tx status says why)" % len(hosts), code=1)
 
     missing = sorted(h for h in hosts if entries[h][0] is None)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -4495,7 +4542,13 @@ def build_parser():
     _add_fleet_flags(s)
     _add_start_flags(s)
 
-    st = sub.add_parser("status", help="one line per host")
+    st = sub.add_parser(
+        "status", help="one line per host",
+        epilog="exit status: 1 if any host is FAILED, TIMEOUT, SETUP-FAILED, "
+               "NEVER RAN or GONE, or could not be read (UNREACHABLE, "
+               "REFUSED, NO-ANSWER); 0 while the rest are running, passed, "
+               "or have nothing there yet. --watch exits with what its last "
+               "look found.")
     _add_fleet_flags(st)
     st.add_argument("--watch", type=float, nargs="?", const=2.0, metavar="S",
                     help="repeat every S seconds (default: 2)")
@@ -4552,8 +4605,11 @@ def build_parser():
     r.add_argument("--stop-on-fail", action="store_true",
                    help="with --batch, stop after a failed wave")
 
-    ex = sub.add_parser("export",
-                        help="write results for the layout viewer")
+    ex = sub.add_parser(
+        "export", help="write results for the layout viewer",
+        epilog="exit status: 1 if no host has a run record, and nothing is "
+               "written. A host that is down is exported as UNREACHABLE and "
+               "does not change the exit.")
     _add_fleet_flags(ex)
     ex.add_argument("--from", dest="from_dir", metavar="DIR",
                     help="read a collected directory instead of the fleet")
