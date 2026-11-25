@@ -55,6 +55,9 @@ check-in.
   as muster does.
 - `tests/test_mutations.sh`: removing the warning, and turning its
   comparison around, are each caught.
+- `tests/test_adversarial_mutations.sh`: the mutation that drops setup and
+  teardown from a `--muster` wave's bound follows that line into
+  `_muster_wave_bound`, which the lease and the warning now share.
 
 ## [2.0.1] - 2026-11-25
 
