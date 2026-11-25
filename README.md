@@ -363,6 +363,26 @@ Too short, and an item goes back to the pool while tx is still running it
 — the one thing the lease exists to prevent. `--muster-cmd` names how to
 invoke muster when it is not simply `muster` on the `PATH`.
 
+**When a lease lapses mid-sweep**, the pool hands its item out again,
+possibly back to this same sweep. tx never runs an item twice: one it has
+already been handed is held under the new lease instead. If a take hands
+back nothing else, tx asks the pool which items are available that this
+sweep has not been handed (`muster list --state available`) and takes
+those by name, so a lapsed lease never ends a sweep while the pool still
+has fresh work. An item that never ran is put back once, at the end,
+under the lease that holds it then; one whose host was still running when
+its wave stopped waiting is left to its new lease, as it was to the
+first. muster counts each hand-back as another attempt.
+
+tx does not renew a lease, or check it before each step: binnacle's
+`muster` has no verb to renew one. So a lease that lapses while tx is
+still collecting from a host, or cleaning it, can let another worker take
+that item and deploy onto the same host in the meantime. The check-in
+reports it: muster's `CONFLICT` (somebody else holds it now, and their run
+is the duplicate) or `LATE` (nobody had taken it). The default lease is
+long enough that this needs a wave far past its own time bound; an
+explicit `--lease` shorter than a wave can take is what lets it happen.
+
 [b]: https://github.com/MartinGallagher-code/binnacle
 
 ---

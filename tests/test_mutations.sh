@@ -348,11 +348,45 @@ m_a_muster_wave_is_checked_in_uncollected() {
 }
 
 m_a_stood_down_muster_wave_stays_held() {
-    mutant '                holding.append((head, [i for i in fresh
-                                       if i not in exc.left]))' \
-           '                holding.append((head, [i for i in ()
-                                       if i not in exc.left]))' || return 1
+    mutant '                hold(head, [i for i in fresh if i not in exc.left])' \
+           '                hold(head, [i for i in () if i not in exc.left])' \
+        || return 1
     caught test_interrupt.sh "a muster wave arming puts items back"
+}
+
+# ---- a lease that lapses in a --muster sweep (TX-009) -----------------------
+
+m_a_lapsed_lease_ends_the_sweep() {
+    # The bug as it was: a take that handed back only items whose lease
+    # had lapsed was read as an empty pool, and the sweep ended.
+    mutant '                    by_name = _fresh_in_pool(args, seen, args.batch)' \
+           '                    by_name = []' || return 1
+    caught test_muster.sh "a lapsed lease does not end it" \
+                          "a lapsed item is released once"
+}
+
+m_a_lapsed_item_is_released_under_its_first_lease() {
+    # The bug as it was, in effect: released under the lease it was first
+    # taken on, which no longer holds it, so muster refused the release
+    # with a CONFLICT naming tx's own newer lease.
+    mutant '            holding[item] = head' \
+           '            holding.setdefault(item, head)' || return 1
+    caught test_muster.sh "a lapsed item is released once"
+}
+
+m_a_running_item_is_put_back() {
+    # An item left to its lease, handed back once that lapsed, was put
+    # back at the end with the items that never ran.
+    mutant '                    if item in leased:' \
+           '                    if False:' || return 1
+    caught test_muster.sh "a running item stays left"
+}
+
+m_an_item_by_name_is_an_option() {
+    mutant '            want = (["--item=%s" % i for i in by_name] if by_name' \
+           '            want = ([a for i in by_name for a in ("--item", i)] if by_name' \
+        || return 1
+    caught test_muster.sh "an item by name can start with -"
 }
 
 echo "mutations"
@@ -382,4 +416,8 @@ run_test "a sweep with no resume is caught"     m_a_sweep_gives_no_resume
 run_test "a muster wave left held is caught"    m_a_muster_wave_is_left_to_its_lease
 run_test "an uncollected check-in is caught"    m_a_muster_wave_is_checked_in_uncollected
 run_test "a stood-down wave held is caught"     m_a_stood_down_muster_wave_stays_held
+run_test "a lapsed lease ending it is caught"  m_a_lapsed_lease_ends_the_sweep
+run_test "a release under the old lease caught" m_a_lapsed_item_is_released_under_its_first_lease
+run_test "a running item put back is caught"   m_a_running_item_is_put_back
+run_test "an item read as an option is caught" m_an_item_by_name_is_an_option
 report_tests

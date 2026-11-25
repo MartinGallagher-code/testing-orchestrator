@@ -9,6 +9,53 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-11-25
+
+What a `--muster` sweep does when one of its leases lapses under it
+(TX-009, found by TX-004's adversarial pass). With one item per wave, an
+unreachable item whose lease lapsed was handed straight back by the next
+take; tx held it rather than run it twice, saw nothing new in that take,
+and ended the sweep with the rest of the pool never run. It then put
+that one item back twice, once under each lease, and the release under
+the first drew a `CONFLICT` naming tx's own second lease.
+
+### Fixed
+
+- **A lapsed lease no longer ends a sweep.** A take that hands back only
+  items this sweep has already been handed is not an empty pool: tx now
+  asks the pool (`muster list --state available`) what it has that this
+  sweep has not seen, and takes those by name, in the pool's own order.
+  The sweep ends only when that answer is empty, so it cannot spin on an
+  item that keeps lapsing either. A name starting with `-` is passed as
+  `--item=NAME`, so muster cannot read it as an option.
+- **Each item is put back once, under the lease that holds it now.** "putting
+  2 item(s) back" for one item, and the `CONFLICT` against tx's own
+  newer lease, are gone: an item handed back after a lapse is held under
+  the new lease in place of the old.
+- **An item still running stays left to its lease.** One a wave left to
+  its lease because its host was still working, handed back once that
+  lease lapsed, was put back at the end with the items that never ran,
+  for the next worker to deploy onto a host that might still be running
+  it. It is now left to its new lease the same way.
+
+### Documentation
+
+- README, *Drawing the work from a pool*: what happens when a lease
+  lapses mid-sweep, and that tx does not renew a lease or check it
+  before each step (binnacle's `muster` has no verb to renew one), so a
+  lease that lapses while tx is collecting from a host or cleaning it can
+  let another worker onto that host; the check-in then reports it.
+
+### Tests
+
+- `tests/test_muster.sh`: `down1 a b c d e f` with down1 unreachable,
+  `--batch 1` and a 1s lease runs every reachable item and leaves down1
+  available; the same sweep puts down1 back once, with no `CONFLICT`; an
+  item still running when its lease lapses is not put back; a pool item
+  starting with `-` taken by name does not stop the sweep.
+- `tests/test_mutations.sh`: a mutation for each fix, each caught by its
+  test; the stood-down-wave mutation retargeted to the code it now names.
+
 ## [1.3.1] - 2026-11-24
 
 What Ctrl-C during `tx run` does to the hosts, and what it tells the

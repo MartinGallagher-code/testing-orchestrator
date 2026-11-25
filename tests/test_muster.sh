@@ -408,6 +408,132 @@ t_the_pools_own_status_is_printed_at_the_end() {
 
 # ---- the flag's own guardrails --------------------------------------------
 
+# ---- a lease that lapses mid-sweep (TX-009) --------------------------------
+
+# down_host NAME -- ssh and scp to NAME fail the way an unreachable host's
+# do (exit 255), so no wave holding it can start. Everything else still
+# goes through the fake fleet.
+down_host() {
+    local tool
+    for tool in ssh scp; do
+        [ -f "$FAKE_BIN/$tool.up" ] || mv "$FAKE_BIN/$tool" "$FAKE_BIN/$tool.up"
+        cat > "$FAKE_BIN/$tool" <<SHIM
+#!/usr/bin/env bash
+for a in "\$@"; do
+    case "\$a" in
+        $1|*@$1|$1:*|*@$1:*)
+            echo "$tool: connect to host $1 port 22: Connection refused" >&2
+            exit 255 ;;
+    esac
+done
+exec "\$FAKE_BIN/$tool.up" "\$@"
+SHIM
+        chmod +x "$FAKE_BIN/$tool"
+    done
+}
+
+t_a_lapsed_lease_does_not_end_the_sweep() {
+    # TX-004's adversarial pass, suspect 3. down1 cannot start, so it is
+    # held to be put back at the end. Its 1s lease lapses while a runs,
+    # and the next take hands it straight back: tx held it rather than run
+    # it twice, found nothing fresh in that take, and ended the sweep with
+    # b to f still available and never run. A take that hands back only
+    # what this sweep has already seen is not an empty pool.
+    install_fake_ssh
+    install_fake_muster
+    down_host down1
+    pool="$(make_pool down1 a b c d e f)"
+    plan="$(sweep_plan down1 a b c d e f)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease 1s \
+        --start-in 1 --no-skew-check -d results --quiet
+    assert_status 1 "$RUN_RC" "down1's wave did not start, which is worth an exit code"
+    for h in a b c d e f; do
+        assert_file_exists "results/pool~$h~out~who" "$h was left in the pool, never run"
+    done
+    assert_contains "$RUN_OUT" "came back with a lapsed lease"
+    # Every reachable item done, and down1 back in the pile for somebody
+    # else: nothing left held.
+    assert_eq "pool.csv,7,6,0,1,85.71,0" \
+        "$(muster status --pool "$pool" --csv | tail -1)"
+    assert_contains "$(muster list --pool "$pool")" "down1,available"
+}
+
+t_a_lapsed_item_is_released_once_under_its_own_lease() {
+    # The same sweep's check-in. down1 was held twice, under two leases,
+    # and was put back twice: "putting 2 item(s) back" for one item, and
+    # the release under the first lease drew a CONFLICT naming tx's own
+    # second one. It is one item, released once, under the lease it is
+    # held by now.
+    install_fake_ssh
+    install_fake_muster
+    down_host down1
+    pool="$(make_pool down1 a b c)"
+    plan="$(sweep_plan down1 a b c)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease 1s \
+        --start-in 1 --no-skew-check -d results --quiet
+    assert_contains "$RUN_OUT" "came back with a lapsed lease"
+    assert_contains "$RUN_OUT" "putting 1 item(s) back"
+    assert_not_contains "$RUN_OUT" "CONFLICT"
+    assert_eq "pool.csv,4,3,0,1,75.00,0" \
+        "$(muster status --pool "$pool" --csv | tail -1)"
+}
+
+t_an_item_still_running_stays_left_to_its_lease() {
+    # A wave that stops waiting with a host still working leaves its item
+    # to its lease: putting it back would hand a running host to the next
+    # worker. When that lease lapses and the pool hands the item back, tx
+    # holds it under the new lease and leaves it to that one the same
+    # way, rather than putting it back at the end with what never ran.
+    install_fake_ssh
+    install_fake_muster
+    pool="$(make_pool slow a b)"
+    plan="$(plan_for --run '[ "$TX_HOST" = slow ] && sleep 8; echo "$TX_HOST" > "$TX_OUT/who"' \
+            --tag pool --timeout 30 -- slow a b)"
+    # The wait is cut to 4s, so slow is still working when it runs out.
+    RUN_OUT="$(python3 - "$(dirname "$TX")" run --plan "$plan" \
+        --muster "$pool" --batch 1 --lease 1s --start-in 1 \
+        --no-skew-check -d results --quiet 2>&1 <<'PY'
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import tx
+tx._wait_deadline = lambda args, plan: time.time() + 4
+sys.exit(tx.main(sys.argv[2:]))
+PY
+)"
+    RUN_RC=$?
+    assert_status 1 "$RUN_RC" "a wave whose wait ran out is worth an exit code"
+    assert_contains "$RUN_OUT" "leaving 1 item(s) still running to their lease"
+    assert_contains "$RUN_OUT" "came back with a lapsed lease"
+    assert_file_exists "results/pool~a~out~who" "a was never run"
+    assert_file_exists "results/pool~b~out~who" "b was never run"
+    assert_not_contains "$RUN_OUT" "putting" \
+        "an item still running was put back for the next worker"
+}
+
+t_a_pool_item_taken_by_name_can_start_with_a_dash() {
+    # After a take that hands back only lapsed items, the next is taken by
+    # name. An item that starts with '-' is never run, but it is still
+    # taken, and as a separate argument muster read it as an option and
+    # stopped the sweep. It is taken as --item=NAME, refused and put back.
+    install_fake_ssh
+    install_fake_muster
+    down_host down1
+    printf '%s\n' 'item,state,holder,lease_id,taken_ts,expires_ts,done_ts,attempts,note' \
+        'down1,available,,,,,,0,' 'a,available,,,,,,0,' \
+        '-oProxyCommand=true,available,,,,,,0,' 'b,available,,,,,,0,' \
+        > "$TEST_TMPDIR/pool.csv"
+    plan="$(sweep_plan down1 a b)"
+    run_tx run --plan "$plan" --muster "$TEST_TMPDIR/pool.csv" --batch 1 \
+        --lease 1s --start-in 1 --no-skew-check -d results --quiet
+    assert_status 1 "$RUN_RC"
+    assert_not_contains "$RUN_OUT" "could not be read or written"
+    assert_contains "$RUN_OUT" "not running pool item '-oProxyCommand=true'"
+    assert_file_exists "results/pool~b~out~who" "b was never run"
+    pool="$(muster list --pool "$TEST_TMPDIR/pool.csv")"
+    assert_contains "$pool" "a,done"
+    assert_contains "$pool" "b,done"
+}
+
 t_muster_needs_a_batch_size() {
     install_fake_muster
     run_tx run --muster pool.csv --start-in 1
@@ -438,6 +564,10 @@ run_test "an uncleaned wave is counted"        t_a_wave_that_cannot_be_cleaned_i
 run_test "another worker's items are left"     t_items_another_worker_holds_are_left_alone
 run_test "an empty pool runs nothing"          t_an_empty_pool_runs_nothing
 run_test "the pool's own status is printed"    t_the_pools_own_status_is_printed_at_the_end
+run_test "a lapsed lease does not end it"      t_a_lapsed_lease_does_not_end_the_sweep
+run_test "a lapsed item is released once"      t_a_lapsed_item_is_released_once_under_its_own_lease
+run_test "a running item stays left"           t_an_item_still_running_stays_left_to_its_lease
+run_test "an item by name can start with -"    t_a_pool_item_taken_by_name_can_start_with_a_dash
 run_test "muster needs a batch size"           t_muster_needs_a_batch_size
 run_test "muster and resume are exclusive"     t_muster_and_resume_do_not_go_together
 run_test "a lease without a pool is refused"   t_a_lease_without_a_pool_is_refused
