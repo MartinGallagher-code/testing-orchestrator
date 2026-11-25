@@ -468,6 +468,76 @@ m_an_item_by_name_is_an_option() {
     caught test_muster.sh "an item by name can start with -"
 }
 
+# ---- export's and the CLI's rough edges (TX-010) -----------------------------
+
+m_a_spaced_host_stops_the_export() {
+    # The bug as it was: one host whose name no target can hold stopped
+    # the export for every host.
+    mutant '            left_out.append(host)' \
+           '            die("target %r: a target can hold no whitespace" % host)' \
+        || return 1
+    caught test_export.sh "a host named with a space left out"
+}
+
+m_names_cannot_map_a_spaced_host() {
+    mutant '                if len(parts) != 2 and "=" in line:' \
+           '                if False:' || return 1
+    caught test_export.sh "names maps a host with a space"
+}
+
+m_two_hosts_on_one_target_pass() {
+    mutant '        if len(owners) > 1:' '        if False:' || return 1
+    caught test_export.sh "two hosts on one target refused"
+}
+
+m_an_unreadable_record_vanishes() {
+    mutant '                unreadable.setdefault(tag, []).append(host)' \
+           '                pass' || return 1
+    caught test_export.sh "an unreadable record has no record"
+}
+
+m_an_unreadable_jobs_file_is_a_host() {
+    # Taking any `tag~X~run.json` as host X's record: a job's own
+    # run.json, cut short, became a host called web01~out.
+    mutant '    if len(parts) != 2 or not all(parts):' \
+           '    if len(parts) < 2 or not all(parts):
+        return None, None
+    if len(parts) > 2:
+        return parts[0], FLAT_SEP.join(parts[1:])
+    if False:' || return 1
+    caught test_export.sh "an unreadable record has no record"
+}
+
+m_a_broken_pipe_is_a_traceback() {
+    mutant '    except BrokenPipeError:
+        return _output_closed(args)' '    except ZeroDivisionError:
+        return _output_closed(args)' || return 1
+    caught test_cli.sh "a closed pipe ends tx quietly"
+}
+
+m_a_broken_pipe_partway_is_silent() {
+    mutant '    if (args is None or args.cmd not in PARTWAY' \
+           '    if (True or args.cmd not in PARTWAY' || return 1
+    caught test_cli.sh "a closed pipe partway says so"
+}
+
+m_a_refused_take_is_an_unreadable_pool() {
+    # What tx said, whatever muster had refused.
+    mutant '        die("muster refused the %s (exit %d; %s): %s"' \
+           '        die("muster %s: the pool could not be read or written (exit %d; %s): %s"' \
+        || return 1
+    caught test_muster.sh "a lease muster refuses is named"
+}
+
+m_a_function_defined_twice() {
+    mutant 'def _median(values):' 'def _median(values):
+    return None
+
+
+def _median(values):' || return 1
+    caught test_cli.sh "no function is defined twice"
+}
+
 echo "mutations"
 run_test "stop waiting on any agent is caught"  m_stop_waits_on_any_agent
 run_test "trusting a live pid is caught"        m_a_live_pid_is_trusted
@@ -509,4 +579,13 @@ run_test "a lapsed lease ending it is caught"  m_a_lapsed_lease_ends_the_sweep
 run_test "a release under the old lease caught" m_a_lapsed_item_is_released_under_its_first_lease
 run_test "a running item put back is caught"   m_a_running_item_is_put_back
 run_test "an item read as an option is caught" m_an_item_by_name_is_an_option
+run_test "a spaced host stopping it is caught" m_a_spaced_host_stops_the_export
+run_test "names without spaces is caught"      m_names_cannot_map_a_spaced_host
+run_test "two hosts on one target is caught"   m_two_hosts_on_one_target_pass
+run_test "a vanishing record is caught"        m_an_unreadable_record_vanishes
+run_test "a job's file as a host is caught"    m_an_unreadable_jobs_file_is_a_host
+run_test "a broken pipe traceback is caught"   m_a_broken_pipe_is_a_traceback
+run_test "a silent cut-off is caught"          m_a_broken_pipe_partway_is_silent
+run_test "a take refused as unreadable caught" m_a_refused_take_is_an_unreadable_pool
+run_test "a function defined twice is caught"  m_a_function_defined_twice
 report_tests

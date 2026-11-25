@@ -133,8 +133,19 @@ def main():
     by = dict((r["item"], r) for r in rows)
 
     if a.verb == "take":
+        # A lease that is not a length of time is a usage error, refused
+        # with exit 2 before the pool is touched -- as binnacle's muster
+        # refuses `--lease=-5m` ("bad duration").
+        try:
+            span = dur(a.lease)
+        except ValueError:
+            span = -1
+        if span <= 0:
+            sys.stderr.write("muster take: error: bad duration %r\n"
+                             % a.lease)
+            return 2
         lease_id = "L%06x" % random.randrange(1 << 24)
-        exp = now + dur(a.lease)
+        exp = now + span
         taken = []
         if a.item:
             for name in names_in(" ".join(a.item)):
@@ -533,6 +544,24 @@ t_muster_and_resume_do_not_go_together() {
     assert_contains "$RUN_OUT" "do not go together"
 }
 
+t_a_lease_muster_refuses_is_named_as_refused() {
+    # muster refusing the argument is not a pool it could not read or
+    # write, which is what tx used to say. muster's own words come first,
+    # then tx's line names the verb, the exit and what was left undone.
+    install_fake_ssh
+    install_fake_muster
+    pool="$(make_pool a b)"
+    plan="$(sweep_plan a b)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 1 --lease=-5m \
+        --start-in 1 --no-skew-check -d results --quiet
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "muster: muster take: error: bad duration"
+    assert_contains "$RUN_OUT" "muster refused the take (exit 2; what it said is above): nothing was leased and nothing was run"
+    assert_not_contains "$RUN_OUT" "could not be read or written"
+    assert_eq "0" "$(find results -name 'pool~*~out~who' 2>/dev/null | wc -l | tr -d ' ')" \
+        "nothing ran"
+}
+
 t_a_lease_without_a_pool_is_refused() {
     run_tx run --lease 2h
     assert_status 2 "$RUN_RC"
@@ -557,4 +586,5 @@ run_test "an item by name can start with -"    t_a_pool_item_taken_by_name_can_s
 run_test "muster needs a batch size"           t_muster_needs_a_batch_size
 run_test "muster and resume are exclusive"     t_muster_and_resume_do_not_go_together
 run_test "a lease without a pool is refused"   t_a_lease_without_a_pool_is_refused
+run_test "a lease muster refuses is named"     t_a_lease_muster_refuses_is_named_as_refused
 report_tests

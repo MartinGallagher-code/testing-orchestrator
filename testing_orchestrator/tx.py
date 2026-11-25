@@ -85,7 +85,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -2303,13 +2303,17 @@ def _write_csv(results, dest, path):
 # ---------------------------------------------------------------------------
 
 def _median(values):
-    if not values:
+    """The middle value, or the mean of the two middle ones; None for none.
+
+    One definition, for `tx summarize` and `tx export` both: a second copy
+    further down the file once shadowed this one, identical by luck.
+    """
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
         return None
-    s = sorted(values)
-    mid = len(s) // 2
-    if len(s) % 2:
-        return s[mid]
-    return (s[mid - 1] + s[mid]) / 2.0
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
 def cmd_summarize(args, plan=None):
@@ -3208,9 +3212,26 @@ def _muster(args, verb, rest, quiet=True):
         if line.strip():
             log("  muster: %s" % line.rstrip())
     if p.returncode >= 2:
-        die("muster %s: the pool could not be read or written, so nothing "
-            "was leased and nothing was run" % verb)
+        # Exit 2 is muster refusing what it was asked -- an argument it
+        # would not take (`--lease=-5m`) as often as a pool it could not
+        # lock -- and only muster knows which, so its own words above are
+        # the diagnosis. This line says what that left undone here.
+        die("muster refused the %s (exit %d; %s): %s"
+            % (verb, p.returncode,
+               "what it said is above" if err.strip() else "it said nothing",
+               MUSTER_REFUSED.get(verb, "the sweep stops here")))
     return p.returncode, out
+
+
+# What a refused muster verb leaves undone, for the line that stops a sweep.
+MUSTER_REFUSED = {
+    "take": "nothing was leased and nothing was run",
+    "done": "the items that ran were not checked in, so they stay held "
+            "under this sweep's lease and go back to the pool when it lapses",
+    "release": "the items nothing ran on were not put back, so they go "
+               "back to the pool when this sweep's lease lapses",
+    "status": "the pool's own account of what is left is not shown",
+}
 
 
 def _ticket_parts(path):
@@ -3705,15 +3726,6 @@ def pct(part, whole):
     return 100.0 * part / whole if whole else None
 
 
-def _median(values):
-    ordered = sorted(values)
-    n = len(ordered)
-    if not n:
-        return None
-    mid = n // 2
-    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
-
-
 def _fmt_num(value):
     """A number for a results file: four significant digits, fixed notation.
     `%g` would write a long runtime as 1.235e+04, which is correct and
@@ -3753,6 +3765,12 @@ def _load_names(path):
     One mapping per line, `txname target`, separated by whitespace or '='.
     Blank lines and '#' comments are ignored, and a host the file does not
     mention keeps its plan name -- so the file only carries the exceptions.
+
+    `txname = target` is also the plan's own [hosts] form, and in it the
+    tx name may hold spaces (`c d = rack1-cd`): that is how a host whose
+    name no results file can carry gets onto the floor (TX-010). It is
+    read that way only where the plain split does not give two names, so
+    a line that meant something before means the same now.
     """
     names = {}
     try:
@@ -3762,8 +3780,14 @@ def _load_names(path):
                 if not line:
                     continue
                 parts = line.replace("=", " ").split()
+                if len(parts) != 2 and "=" in line:
+                    txname, _eq, target = line.partition("=")
+                    parts = [txname.strip(), target.strip()]
+                    if not all(parts) or len(parts[1].split()) != 1:
+                        parts = []
                 if len(parts) != 2:
-                    die("%s line %d: want `txname target`, got %r"
+                    die("%s line %d: want `txname target` (or `txname = "
+                        "target`, where the tx name may hold spaces), got %r"
                         % (path, lineno, line))
                 names[parts[0]] = parts[1]
     except (IOError, OSError) as exc:
@@ -3793,16 +3817,21 @@ class Overlay(object):
         """The layout's name for a tx host: mapped by --names, then prefixed
         by --target-prefix. The viewer resolves a bare name, a path, or any
         unique tail of a path, so `web01`, `R01/web01` and `DH1/A/R01/web01`
-        can all land on the same node."""
+        can all land on the same node.
+
+        None when the name cannot be a target: a results file is
+        whitespace separated and quote aware, so a target can hold
+        neither (`_export_targets` says what is done about it)."""
         name = self.target_prefix + self.names.get(host, host)
         if not name or any(c in name for c in BAD_IN_FIELD):
-            die("target %r: a results file is whitespace separated and quote "
-                "aware, so a target can hold neither (host %r)" % (name, host))
+            return None
         return name
 
     def add(self, test, host, value, extras=()):
-        """File one sample. `None` is dropped: not measured is not zero."""
-        if value is None:
+        """File one sample. `None` is dropped: not measured is not zero,
+        and nor is a host with no target (`_export_targets` left it out)."""
+        target = self.target(host)
+        if value is None or target is None:
             return
         if not isinstance(value, str):
             num = _export_number(value)
@@ -3818,7 +3847,7 @@ class Overlay(object):
         extras = list(extras)
         if self.run:
             extras.append("run=%s" % self.run)
-        self.samples.append((name, self.target(host), value, extras))
+        self.samples.append((name, target, value, extras))
 
     def tsv_lines(self, with_meta=True):
         out = []
@@ -3909,11 +3938,18 @@ def _read_collected_reports(path, want_tag=None):
     The tag is what lets several runs share a directory, so a directory
     holding more than one is read for `want_tag` (the plan's) alone: taking
     whichever record sorted last mixed two runs' numbers into one export.
+
+    Returns ({host: report}, [host...]): the second is the hosts whose
+    record is there, for that tag, but could not be read -- cut short,
+    say. Without a plan to name them they would vanish from the export,
+    where with one they are NO-DATA, so they are handed back to be the
+    same: a host with no record (TX-010).
     """
     if not os.path.isdir(path):
         die("--from %s: not a directory (point it at a `tx collect` "
             "directory)" % path)
     by_tag = {}
+    unreadable = {}         # tag -> [host], from the file's name alone
     for name in sorted(os.listdir(path)):
         if not name.endswith(FLAT_SEP + REPORT_NAME) and name != REPORT_NAME:
             continue
@@ -3923,6 +3959,9 @@ def _read_collected_reports(path, want_tag=None):
                 report = json.load(fh)
         except (IOError, OSError, ValueError) as exc:
             sys.stderr.write("[tx] export: skipping %s: %s\n" % (name, exc))
+            tag, host = _record_file_parts(name)
+            if host is not None:
+                unreadable.setdefault(tag, []).append(host)
             continue
         if not isinstance(report, dict):
             sys.stderr.write("[tx] export: skipping %s: not a run record "
@@ -3947,47 +3986,45 @@ def _read_collected_reports(path, want_tag=None):
         die("no run.json records in %s/ -- is it a `tx collect` directory?"
             % path, code=1)
     if len(by_tag) == 1:
-        return list(by_tag.values())[0]
-    tags = ", ".join(sorted(t or "(untagged)" for t in by_tag))
-    if want_tag in by_tag:
-        return by_tag[want_tag]
-    die("%s/ holds the records of %d runs (tags: %s); export reads one -- "
-        "give --plan the plan whose tag you mean"
-        % (path, len(by_tag), tags))
+        tag = list(by_tag)[0]
+    elif want_tag in by_tag:
+        tag = want_tag
+    else:
+        tags = ", ".join(sorted(t or "(untagged)" for t in by_tag))
+        die("%s/ holds the records of %d runs (tags: %s); export reads one "
+            "-- give --plan the plan whose tag you mean"
+            % (path, len(by_tag), tags))
+    return by_tag[tag], unreadable.get(tag, [])
+
+
+def _record_file_parts(name):
+    """(tag, host) as a record's file name gives them, or (None, None).
+
+    For a record that could not be read, so the host inside it cannot be
+    either. Only `tag~host~run.json` with no other `~`: a job's own
+    run.json is flattened with at least one more (`tag~host~out~run.json`),
+    so a name with a `~` left over could be either, and is not claimed.
+    """
+    suffix = FLAT_SEP + REPORT_NAME
+    if not name.endswith(suffix):
+        return None, None
+    parts = name[:-len(suffix)].split(FLAT_SEP)
+    if len(parts) != 2 or not all(parts):
+        return None, None
+    return parts[0], parts[1]
 
 
 def cmd_export(args):
     have_plan = os.path.isfile(args.plan)
     plan = load_plan(args.plan) if have_plan else None
+    if not args.from_dir and plan is None:
+        die("plan not found: %s -- export reads the fleet named in the "
+            "plan; make one with `tx gen`, or read a collection with "
+            "`tx export --from DIR`" % args.plan)
 
-    # {host: (report-or-None, word-or-None)}, and the host order to walk.
-    entries = {}
-    if args.from_dir:
-        reports = _read_collected_reports(args.from_dir,
-                                          plan.tag if plan else None)
-        for host, report in reports.items():
-            entries[host] = (report, None)
-        # The plan, when there is one, is the roll call: a host it names that
-        # the collection has no record of never made it back. It is not a
-        # filter -- a --muster sweep runs items the plan never names, and
-        # their records are as much the run's as any.
-        hosts = sorted(reports)
-        if plan:
-            hosts = list(plan.hosts) + [h for h in hosts
-                                        if h not in plan.addrs]
-        for host in hosts:
-            entries.setdefault(host, (None, "NO-DATA"))
-    else:
-        if plan is None:
-            die("plan not found: %s -- export reads the fleet named in the "
-                "plan; make one with `tx gen`, or read a collection with "
-                "`tx export --from DIR`" % args.plan)
-        seen = _collect_status(Fleet(plan, args))
-        hosts = list(plan.hosts)
-        for host in hosts:
-            _alive, report, word = seen[host]
-            entries[host] = (report, word)
-
+    # Checked before anything is read: each of these lands on every line,
+    # so one bad one is a whole export refused, and saying so costs the
+    # fleet no round trip.
     if args.run and any(c in args.run for c in BAD_IN_FIELD):
         die("--run %r: the label is written onto every sample line, so it "
             "can hold no whitespace or quotes" % args.run)
@@ -3995,11 +4032,42 @@ def cmd_export(args):
         die("--test-prefix %r: it leads every test name in a whitespace "
             "separated file, so it can hold no whitespace or quotes"
             % args.test_prefix)
+    if any(c in args.target_prefix for c in BAD_IN_FIELD):
+        die("--target-prefix %r: it leads every target in a whitespace "
+            "separated file, so it can hold no whitespace or quotes"
+            % args.target_prefix)
 
     out = Overlay(test_prefix=args.test_prefix,
                   target_prefix=args.target_prefix,
                   names=_load_names(args.names) if args.names else None,
                   run=args.run)
+
+    # {host: (report-or-None, word-or-None)}, and the host order to walk.
+    entries = {}
+    if args.from_dir:
+        reports, unreadable = _read_collected_reports(
+            args.from_dir, plan.tag if plan else None)
+        for host, report in reports.items():
+            entries[host] = (report, None)
+        # The plan, when there is one, is the roll call: a host it names that
+        # the collection has no record of never made it back. It is not a
+        # filter -- a --muster sweep runs items the plan never names, and
+        # their records are as much the run's as any. A host whose record
+        # is there but cannot be read is one with no record, plan or not.
+        hosts = sorted(set(reports) | set(unreadable))
+        if plan:
+            hosts = list(plan.hosts) + [h for h in hosts
+                                        if h not in plan.addrs]
+        for host in hosts:
+            entries.setdefault(host, (None, "NO-DATA"))
+        left_out = _export_targets(out, hosts)
+    else:
+        hosts = list(plan.hosts)
+        left_out = _export_targets(out, hosts)
+        seen = _collect_status(Fleet(plan, args))
+        for host in hosts:
+            _alive, report, word = seen[host]
+            entries[host] = (report, word)
 
     # The fleet's own median runtime, which is what makes a host's time
     # readable without knowing the hardware. One host is not a fleet, and a
@@ -4013,8 +4081,14 @@ def cmd_export(args):
                 durations.append(d)
     fleet_median = _median(durations) if len(durations) > 1 else None
 
+    # Left out of the file, not out of the fleet: a host whose name no
+    # target can hold still ran with the rest, so its time stays in the
+    # median above.
+    skip = set(left_out)
     ran = 0
     for host in hosts:
+        if host in skip:
+            continue
         report, word = entries[host]
         out.add("state", host, _export_state(report, word))
         if report is None:
@@ -4043,10 +4117,16 @@ def cmd_export(args):
     # UNREACHABLE states and exited 0 (TX-006). A host that is down while
     # others have records is still exported, its state as data, and exit 0.
     if not ran:
+        named_out = [h for h in left_out if entries[h][0] is not None]
+        if named_out:
+            die("nothing to export -- the only host(s) with a run record "
+                "have names a target cannot hold: %s (%s)"
+                % (_quoted_hosts(named_out), LEFT_OUT_FIX), code=1)
         die("nothing to export -- none of the %d host(s) has a run record "
             "yet (tx status says why)" % len(hosts), code=1)
 
-    missing = sorted(h for h in hosts if entries[h][0] is None)
+    missing = sorted(h for h in hosts
+                     if h not in skip and entries[h][0] is None)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     tag = plan.tag if plan else (
         next((r.get("tag") for r, _w in entries.values() if r), "") or "tx")
@@ -4060,6 +4140,10 @@ def cmd_export(args):
     if missing:
         header.append("# %d host(s) have no record (tx_state NO-DATA/NOT-RUN): "
                       "%s" % (len(missing), " ".join(missing[:8])))
+    if left_out:
+        header.append("# %d host(s) left out, their names holding whitespace "
+                      "or a quote: %s" % (len(left_out),
+                                          _quoted_hosts(left_out)))
     lines = (header +
              (out.json_lines(not args.no_meta) if args.json
               else out.tsv_lines(not args.no_meta)))
@@ -4086,7 +4170,55 @@ def cmd_export(args):
         sys.stderr.write("[tx] export: %d host(s) have no record, so only "
                          "tx_state carries them (NO-DATA/NOT-RUN): %s\n"
                          % (len(missing), " ".join(missing[:8])))
+    if left_out:
+        sys.stderr.write("[tx] export: %d host(s) left out, as a results "
+                         "file cannot hold their names: %s (%s)\n"
+                         % (len(left_out), _quoted_hosts(left_out),
+                            LEFT_OUT_FIX))
     return 0
+
+
+# How to put a left-out host back, for every message that leaves one out.
+LEFT_OUT_FIX = "map each to a target with --names, as `NAME = target`"
+
+
+def _quoted_hosts(hosts, most=8):
+    """Host names that hold a space or worse, each in quotes, on one line."""
+    return (" ".join(repr(h) for h in hosts[:most])
+            + (" ..." if len(hosts) > most else ""))
+
+
+def _export_targets(out, hosts):
+    """The hosts whose own name no target can hold, to be left out.
+
+    A host named with a space (`c d`) runs, is collected and is summarized
+    like any other; only a results file cannot carry its name, so it is
+    left out with a message rather than stopping the export for every
+    host (TX-010). Two things are refused instead, being mistakes in what
+    was asked: a --names target that cannot be one, and two hosts on the
+    one target, which would put two hosts' samples on one node with
+    nothing to tell them apart.
+    """
+    left_out = []
+    by_target = collections.OrderedDict()
+    for host in hosts:
+        target = out.target(host)
+        if target is None:
+            if host in out.names:
+                die("--names maps %r to %r: a results file is whitespace "
+                    "separated and quote aware, so a target can hold neither"
+                    % (host, out.names[host]))
+            left_out.append(host)
+        else:
+            by_target.setdefault(target, []).append(host)
+    for target, owners in by_target.items():
+        if len(owners) > 1:
+            die("--names puts %s on the one target %r: their samples would "
+                "land on one node, with nothing to say which host each came "
+                "from -- give each host a target of its own"
+                % (", ".join(repr(h) for h in owners[:-1])
+                   + " and %r" % owners[-1], target))
+    return left_out
 
 
 
@@ -4620,7 +4752,8 @@ def build_parser():
     ex.add_argument("--json", action="store_true",
                     help="write NDJSON instead of TSV")
     ex.add_argument("--names", metavar="FILE",
-                    help="host name map, one `txname target` per line")
+                    help="host name map, one `txname target` (or "
+                         "`txname = target`) per line")
     ex.add_argument("--target-prefix", default="", metavar="STR",
                     help="prefix for every target, e.g. 'DH1/A/'")
     ex.add_argument("--test-prefix", default="tx_", metavar="STR",
@@ -4709,8 +4842,72 @@ COMMANDS = {
 
 
 def main(argv=None):
-    ap = build_parser()
-    args = ap.parse_args(argv)
+    args = None
+    try:
+        ap = build_parser()
+        args = ap.parse_args(argv)
+        rc = _main(ap, args, argv)
+        # Here, not at the interpreter's exit, so that a reader that went
+        # away before the last of it is answered by the line below rather
+        # than by "Exception ignored" and an exit status of 120.
+        sys.stdout.flush()
+        return rc
+    except BrokenPipeError:
+        return _output_closed(args)
+    except SystemExit:
+        # die() and --help leave this way: what they printed is flushed
+        # here for the same reason, and their own exit status kept.
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            _output_closed(None)
+        raise
+
+
+# A command cut off partway through these has left something half done,
+# and what to do about it.
+PARTWAY = {
+    "start": "`tx status` shows where it left the fleet",
+    "run": "`tx status` shows where it left the fleet",
+    "stop": "`tx status` shows where it left the fleet",
+    "clean": "`tx status` shows where it left the fleet",
+    "collect": "run it again without the pipe to bring back the rest",
+}
+
+
+def _output_closed(args):
+    """stdout's reader went away (`tx start --dry-run | head -3`): stop.
+
+    Quietly, as a pipeline expects, where this was a traceback (TX-010).
+    The exit status is the 1 that traceback gave: the exit codes are the
+    public interface, and the shell's 141 for a broken pipe would be a new
+    one. A command that was changing something -- arming hosts, cleaning
+    them, collecting -- has stopped partway, which a silent exit would
+    hide, so that one says so in a line on stderr.
+    """
+    def quiet(fd):
+        # Whatever is still buffered for a closed pipe goes nowhere, so
+        # the interpreter's own flush at exit cannot fail on it.
+        try:
+            null = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(null, fd)
+            os.close(null)
+        except (OSError, ValueError):
+            pass
+    quiet(1)
+    if (args is None or args.cmd not in PARTWAY
+            or getattr(args, "dry_run", False)):
+        return 1
+    try:
+        sys.stderr.write("tx: the output was closed (broken pipe), so `tx %s` "
+                         "stopped partway; %s\n" % (args.cmd, PARTWAY[args.cmd]))
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        quiet(2)            # `2>&1 | head`: stderr went with it
+    return 1
+
+
+def _main(ap, args, argv):
     if not args.cmd:
         ap.print_help()
         return 2

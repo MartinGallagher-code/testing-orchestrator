@@ -203,6 +203,109 @@ t_an_empty_collection_is_refused() {
     assert_contains "$RUN_OUT" "no run.json records"
 }
 
+# ---- what a results file cannot hold, and what it must not blur (TX-010) ---
+
+# A host named with a space runs, is collected and is summarized; only the
+# results file cannot carry its name. One record of the kind, by --from.
+SPACED='{"host":"c d","tag":"bench","state":"done","exit":0,"timed_out":false,"duration":30.0}'
+
+t_a_host_named_with_a_space_is_left_out() {
+    # It used to stop the whole export: rc 2, every host refused for one.
+    coll="$(write_collection "web01:$STD_A" "c d:$SPACED")"
+    out="$(python3 "$TX" export --plan "$TEST_TMPDIR/none.ini" --from "$coll" \
+           2> "$TEST_TMPDIR/err")"
+    assert_status 0 "$?" "one unusable name does not stop the export"
+    assert_eq "PASSED" "$(sample "$out" tx_state web01)" "the others are exported"
+    assert_not_contains "$out" "c d	" "no sample for the host left out"
+    assert_contains "$out" "# 1 host(s) left out, their names holding whitespace or a quote: 'c d'"
+    assert_contains "$(cat "$TEST_TMPDIR/err")" "left out, as a results file cannot hold their names: 'c d' (map each to a target with --names, as \`NAME = target\`)"
+    # Left out of the file, not out of the fleet: the median is 10 and 30's.
+    assert_eq "50" "$(sample "$out" tx_rel_median web01)" "its time still counts"
+}
+
+t_names_maps_a_host_named_with_a_space() {
+    coll="$(write_collection "web01:$STD_A" "c d:$SPACED")"
+    printf '# the plan'"'"'s own form, so the tx name can hold a space\nc d = R01/u09\n' \
+        > "$TEST_TMPDIR/names.map"
+    run_tx export --plan "$TEST_TMPDIR/none.ini" --from "$coll" \
+        --names "$TEST_TMPDIR/names.map"
+    assert_status 0 "$RUN_RC"
+    assert_eq "PASSED" "$(sample "$RUN_OUT" tx_state R01/u09)" "mapped onto the floor"
+    assert_not_contains "$RUN_OUT" "left out"
+}
+
+t_only_hosts_named_with_a_space_is_nothing_to_export() {
+    coll="$(write_collection "c d:$SPACED")"
+    run_tx export --plan "$TEST_TMPDIR/none.ini" --from "$coll"
+    assert_status 1 "$RUN_RC"
+    assert_contains "$RUN_OUT" "the only host(s) with a run record have names a target cannot hold: 'c d'"
+}
+
+t_a_names_target_that_cannot_be_one_is_refused() {
+    # A mapping somebody wrote is a mistake to point out, not a host to drop.
+    coll="$(write_collection "web01:$STD_A")"
+    printf 'web01 = R01"u07\n' > "$TEST_TMPDIR/names.map"
+    run_tx export --plan "$TEST_TMPDIR/none.ini" --from "$coll" \
+        --names "$TEST_TMPDIR/names.map"
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--names maps 'web01' to 'R01\"u07'"
+}
+
+t_a_target_prefix_with_a_space_is_refused() {
+    coll="$(write_collection "web01:$STD_A")"
+    run_tx export --plan "$TEST_TMPDIR/none.ini" --from "$coll" \
+        --target-prefix 'DH1 A/'
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--target-prefix 'DH1 A/'"
+}
+
+t_two_hosts_on_one_target_are_refused() {
+    # Both hosts' samples on one node, with nothing to say whose: refused.
+    coll="$(write_collection "web01:$STD_A" "web02:$STD_B" "web03:$STD_C")"
+    plan="$(export_plan web01 web02 web03)"
+    printf 'web01 R01/u07\nweb02 R01/u07\n' > "$TEST_TMPDIR/names.map"
+    run_tx export --plan "$plan" --from "$coll" --names "$TEST_TMPDIR/names.map"
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--names puts 'web01' and 'web02' on the one target 'R01/u07'"
+    assert_not_contains "$RUN_OUT" "tx_state	R01/u07" "nothing written"
+    # A host mapped onto another host's own name is the same mistake.
+    printf 'web01 web03\n' > "$TEST_TMPDIR/names.map"
+    run_tx export --plan "$plan" --from "$coll" --names "$TEST_TMPDIR/names.map"
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--names puts 'web01' and 'web03' on the one target 'web03'"
+}
+
+t_a_names_file_for_other_hosts_is_not_a_collision() {
+    # Mappings for hosts this run does not have collide with nothing.
+    coll="$(write_collection "web01:$STD_A")"
+    plan="$(export_plan web01)"
+    printf 'web01 R01/u07\nweb09 R01/u07\n' > "$TEST_TMPDIR/names.map"
+    run_tx export --plan "$plan" --from "$coll" --names "$TEST_TMPDIR/names.map"
+    assert_status 0 "$RUN_RC"
+    assert_eq "PASSED" "$(sample "$RUN_OUT" tx_state R01/u07)"
+}
+
+t_an_unreadable_record_is_a_host_with_no_record() {
+    # A record cut short: with a plan the host was NO-DATA; without one it
+    # vanished, with only a line on stderr. Now it is NO-DATA either way.
+    coll="$(write_collection "web01:$STD_A" \
+                             'web02:{"host":"web02","tag":"bench","sta')"
+    # A job's own run.json, cut short, is the job's: not a host called
+    # web01~out.
+    printf '{"x":' > "$coll/bench~web01~out~run.json"
+    run_tx export --plan "$TEST_TMPDIR/none.ini" --from "$coll"
+    assert_status 0 "$RUN_RC"
+    assert_eq "NO-DATA" "$(sample "$RUN_OUT" tx_state web02)" "no plan, still named"
+    assert_contains "$RUN_OUT" "# 1 host(s) have no record (tx_state NO-DATA/NOT-RUN): web02"
+    assert_not_contains "$RUN_OUT" "web01~out	" "a job's file is not a host"
+    # Another run's broken record, in the same directory, is not this one's.
+    printf '{"host":' > "$coll/other~web05~run.json"
+    run_tx export --plan "$TEST_TMPDIR/none.ini" --from "$coll"
+    assert_status 0 "$RUN_RC"
+    assert_eq "" "$(sample "$RUN_OUT" tx_state web05)" "another tag's host"
+    assert_contains "$RUN_OUT" "# 1 host(s) have no record (tx_state NO-DATA/NOT-RUN): web02"
+}
+
 # ---- the whole way through, against a real run ----------------------------
 
 t_exports_a_real_run_read_from_the_fleet() {
@@ -278,6 +381,14 @@ run_test "append builds a history"             t_append_builds_a_history
 run_test "a run label with a space refused"    t_a_run_label_with_a_space_is_refused
 run_test "live export needs a plan"            t_live_export_without_a_plan_is_refused
 run_test "an empty collection is refused"      t_an_empty_collection_is_refused
+run_test "a host named with a space left out"  t_a_host_named_with_a_space_is_left_out
+run_test "names maps a host with a space"      t_names_maps_a_host_named_with_a_space
+run_test "only spaced names: nothing to export" t_only_hosts_named_with_a_space_is_nothing_to_export
+run_test "a names target with a quote refused" t_a_names_target_that_cannot_be_one_is_refused
+run_test "a target prefix with a space refused" t_a_target_prefix_with_a_space_is_refused
+run_test "two hosts on one target refused"     t_two_hosts_on_one_target_are_refused
+run_test "names for other hosts no collision"  t_a_names_file_for_other_hosts_is_not_a_collision
+run_test "an unreadable record has no record"  t_an_unreadable_record_is_a_host_with_no_record
 run_test "exports a real run from the fleet"   t_exports_a_real_run_read_from_the_fleet
 run_test "a live export with a host down"      t_a_live_export_with_a_host_down_still_exports
 run_test "a live export with no record"        t_a_live_export_with_no_record_is_refused
