@@ -422,15 +422,15 @@ m_status_watch_stops_on_a_failure() {
 m_export_counts_samples_not_hosts() {
     # The bug as it was: tx_state is always written, so this never fired.
     mutant '    if not ran:
-        die("nothing to export' '    if not out.samples:
-        die("nothing to export' || return 1
+        named_out = ' '    if not out.samples:
+        named_out = ' || return 1
     caught test_export.sh "a live export with no record"
 }
 
 m_export_refuses_a_host_down() {
     mutant '    if not ran:
-        die("nothing to export' '    if ran < len(hosts):
-        die("nothing to export' || return 1
+        named_out = ' '    if ran < len(hosts):
+        named_out = ' || return 1
     caught test_export.sh "a live export with a host down"
 }
 
