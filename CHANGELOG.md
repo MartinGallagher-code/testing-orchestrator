@@ -9,6 +9,68 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-11-25
+
+Seven rough edges in `tx export`, the command line and the test suite,
+found and left alone by TX-004's adversarial pass (TX-010). The exit
+codes keep their meanings, and the collected-file names and the results
+format are unchanged.
+
+### Fixed
+
+- **One host whose name holds a space no longer stops the export.** A plan
+  host `c d` runs, is collected and is summarized like any other, but
+  `tx export` refused every host for it (exit 2). That host is now left
+  out of the results file, named in its header and on stderr, and the rest
+  is exported. Its time still counts towards the fleet's median.
+  `--target-prefix` holding whitespace or a quote is refused up front, as
+  `--test-prefix` and `--run` already were.
+- **`--names` can map such a host.** A line may be `txname = target`, the
+  plan's own `[hosts]` form, where the tx name may hold spaces
+  (`c d = rack1-cd`). Only lines that did not read as two names before are
+  read this way, so a file that worked means what it did.
+- **`--names` mapping two hosts onto one target is refused** (exit 2,
+  naming both), instead of writing both hosts' samples onto one node with
+  nothing to tell them apart. A host mapped onto another host's own name
+  is the same mistake. Mappings for hosts the run does not have are not
+  counted.
+- **`tx export --from` without a plan keeps a host whose record is cut
+  short.** It was dropped with only a line on stderr, where with a plan it
+  was `NO-DATA`. It is now `NO-DATA` either way, and on the header's "no
+  record" line. Only a file named exactly `tag~host~run.json`, for the tag
+  being read, is taken for one: a job's own run.json (`tag~host~out~run.json`)
+  is still the job's.
+- **No traceback when the output is piped into `head`.** `tx start
+  --dry-run | head -3` ended in a `BrokenPipeError` traceback. tx now
+  stops quietly, with the exit status 1 that the traceback had. A command
+  cut off while it changes something (`start`, `run`, `stop`, `clean`,
+  `collect`) says in one line on stderr that it stopped partway.
+- **A request muster refuses is named as refused.** A bad `--lease`
+  (`--lease=-5m`) made tx say "the pool could not be read or written".
+  muster had refused the argument. tx now says `muster refused the take
+  (exit 2; what it said is above)`, and what that left undone, after
+  muster's own message. tx also passes the lease as `--lease=VALUE`, as it
+  already passed items as `--item=NAME`: given `--lease -5m` as two
+  arguments, muster read `-5m` as an option and said only that `--lease`
+  wanted a value, never what was wrong with it.
+- **`_median` is defined once.** `tx.py` defined it twice, identically, and
+  the second shadowed the first. A test now fails on any top-level
+  function or class defined twice.
+
+### Tests
+
+- **The suite's teardown stops only its own agents.** It ran `pkill -f`
+  on every tx agent on the machine, so two suites at once, or a suite
+  beside a real tx, killed each other's agents. It now stops only agents
+  whose working directory is under the test's own directory, read from
+  `/proc` (`kill_agents_under` in `tests/test_helper.bash`; with no
+  `/proc`, it stops none). `tests/test_teardown.sh` checks it, and checks
+  that the old teardown, run against a `pkill` that can reach only the
+  test's own stand-ins, kills another run's agent.
+- Every other fix above has a test and a mutation check in
+  `tests/test_mutations.sh`. The muster test double refuses a lease it
+  cannot read with exit 2, as muster does.
+
 ## [2.0.1] - 2026-11-25
 
 What a `--muster` sweep does when one of its leases lapses under it

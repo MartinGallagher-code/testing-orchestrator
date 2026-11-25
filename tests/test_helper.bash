@@ -36,12 +36,51 @@ setup_env() {
 }
 
 teardown_env() {
-    # Anything the tests started is a child of this shell; make sure a
-    # crashed test cannot leave agents blasting packets at the runner.
-    pkill -f "[t]x[.]py agent --host" 2>/dev/null
+    # A crashed test must not leave its agents running on the runner. Only
+    # its own, though: `pkill -f` by name killed every tx agent on the
+    # machine, so two suites at once, or a suite beside a real tx, killed
+    # each other's (TX-010).
+    if [ -n "${TEST_TMPDIR:-}" ]; then
+        kill_agents_under "$TEST_TMPDIR"
+    fi
     if [ -n "${TEST_TMPDIR:-}" ] && [ -d "$TEST_TMPDIR" ]; then
         rm -rf "$TEST_TMPDIR"
     fi
+}
+
+# kill_agents_under DIR -- TERM every `tx.py agent` whose working directory
+# is DIR or below it, and nothing else. An agent works in the directory it
+# was started in, and every one a test starts -- on a fake host or run
+# directly -- is started under that test's $TEST_TMPDIR, so the working
+# directory says whose it is where the name cannot. Read from /proc; with
+# no /proc (macOS) nothing is killed, and an agent a crashed test left ends
+# with its own job's timeout rather than taking someone else's with it.
+kill_agents_under() {
+    [ -d /proc ] || return 0
+    python3 - "$1" <<'PY'
+import os, re, signal, sys
+root = os.path.realpath(sys.argv[1])
+if root == os.sep:
+    sys.exit(0)             # "everything" is never what a test owns
+agent = re.compile(r"tx[.]py agent --host")
+for pid in os.listdir("/proc"):
+    if not pid.isdigit() or int(pid) == os.getpid():
+        continue
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as fh:
+            cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        cwd = os.readlink("/proc/%s/cwd" % pid)
+    except (IOError, OSError):
+        continue            # gone, or not ours to read
+    if cwd.endswith(" (deleted)"):
+        cwd = cwd[:-len(" (deleted)")]
+    if agent.search(cmd) and (cwd == root
+                              or cwd.startswith(root.rstrip(os.sep) + os.sep)):
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            pass
+PY
 }
 
 # Run tx as a subprocess. Captures stdout+stderr in $RUN_OUT, status in $RUN_RC.
@@ -346,7 +385,8 @@ run_test() {
         FAILED_TESTS+=("$label")
         printf '    FAIL  %s (rc=%d)\n' "$label" "$rc"
     fi
-    # teardown_env's pkill sweeps up any agent a killed test left running.
+    # teardown_env sweeps up any agent a killed test left running: its own
+    # agents, by working directory, and nobody else's.
     teardown_env
 }
 

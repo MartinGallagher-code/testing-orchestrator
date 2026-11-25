@@ -383,6 +383,12 @@ is the duplicate) or `LATE` (nobody had taken it). The default lease is
 long enough that this needs a wave far past its own time bound; an
 explicit `--lease` shorter than a wave can take is what lets it happen.
 
+**When muster refuses** a request — exit 2, for an argument it will not
+take, such as a `--lease` it cannot read, or a pool it cannot lock — its
+own message is passed through, and tx stops the sweep with exit 2, naming
+the request and what that left undone: `muster refused the take (exit 2;
+what it said is above): nothing was leased and nothing was run`.
+
 [b]: https://github.com/MartinGallagher-code/binnacle
 
 ---
@@ -667,7 +673,8 @@ It reads each host's record from the name `tx collect` gives it,
 directory that several tagged runs share is read for the plan's tag, and
 refused without a plan to say which. A host with a record that the plan
 does not name (a `--muster` item) is exported too: the plan is the roll
-call, not a filter.
+call, not a filter. A record that is there but cannot be read (cut short,
+say) makes its host one with no record, `NO-DATA`, with a plan or without.
 
 `--names FILE` maps tx host names to the layout's, `--target-prefix DH1/A/`
 addresses nodes by path, `--test-prefix` replaces `tx_`, `--run LABEL` tags
@@ -675,6 +682,15 @@ every sample, and `--json` writes NDJSON for a pipeline rather than a
 person. The prefixes and the label land on every line of a
 whitespace-separated file, so one holding whitespace or a quote is
 refused.
+
+A `--names` file has one mapping per line, `txname target` or, as the
+plan's `[hosts]` has it, `txname = target`, where the tx name may hold
+spaces. A host whose own name holds whitespace or a quote (a plan can name
+one `c d`) cannot be a target, so it is left out of the file, named in its
+header and on stderr, and the other hosts are exported; `c d = rack1-cd`
+in a `--names` file puts it on the floor. Two hosts mapped onto one target
+are refused: their samples would land on one node, with nothing to say
+which host each came from.
 
 ---
 
@@ -882,6 +898,11 @@ or have nothing there yet (`NOT-DEPLOYED`, `NOT-RUNNING`) leave it at 0,
 so a fleet still at work is not a failure. `--watch` keeps looping
 whatever it finds; stopped with Ctrl-C between looks, it exits with what
 the last look found (130 if the Ctrl-C lands while it is asking).
+
+A reader that goes away early (`tx status | head -3`) ends `tx` quietly,
+with no traceback and exit 1. A command cut off that way while it changes
+something — `start`, `run`, `stop`, `clean`, `collect` — has stopped
+partway, and says so in one line on stderr.
 
 `tx export` exits 1 when no host has a run record, and writes nothing. A
 host that is down while others have records does not change its exit: it
