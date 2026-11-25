@@ -29,12 +29,39 @@ import csv, os, sys, time, argparse, random
 FIELDS = ["item", "state", "holder", "lease_id", "taken_ts",
           "expires_ts", "done_ts", "attempts", "note"]
 
+def refuse(msg):
+    # muster's die(): one line on stderr and exit 2, which tx reads as
+    # "nothing was leased" and stops on.
+    sys.stderr.write("muster: %s\n" % msg)
+    sys.exit(2)
+
 def dur(text):
+    # binnacle's parse_duration, rule for rule: '90', '45m', '1h30m',
+    # '1.5h'; anything else, or a total of zero, is refused (TX-011).
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
-    text = str(text).strip().lower()
-    if text and text[-1] in units:
-        return float(text[:-1]) * units[text[-1]]
-    return float(text)
+    s = str(text).strip().lower()
+    if not s:
+        refuse("empty duration")
+    total, num, seen = 0.0, "", False
+    try:
+        for ch in s:
+            if ch.isdigit() or ch == ".":
+                num += ch
+            elif ch in units and num:
+                total += float(num) * units[ch]
+                num, seen = "", True
+            else:
+                refuse("bad duration: %s" % text)
+        if num:
+            total += float(num)
+            seen = True
+    except ValueError:
+        refuse("bad duration: %s" % text)
+    if not seen:
+        refuse("bad duration: %s" % text)
+    if total <= 0:
+        refuse("duration must be more than zero: %s" % text)
+    return total
 
 def read_pool(path):
     if not os.path.exists(path):
@@ -518,6 +545,154 @@ t_a_pool_item_taken_by_name_can_start_with_a_dash() {
     assert_contains "$pool" "b,done"
 }
 
+# ---- a --lease shorter than a wave (TX-011) --------------------------------
+#
+# sweep_plan's job has a 30s timeout and no setup or teardown, so with
+# --batch 2 and --start-in 1 one wave can take 1.03s of arming, the 30s
+# timeout and the minute tx waits on top: 91.03s, printed as 1m31s. The
+# smallest whole-minute lease that covers it is 2m, and the default tx sets
+# is twice the wave and five minutes more: 482s.
+
+# The sweep's own account: its waves, what it checked in or put back, its
+# totals and the pool's last word. Timings, byte counts and the clock
+# differ between any two runs, so they are not part of it.
+sweep_summary() {
+    printf '%s\n' "$1" | grep -e '=== wave' -e 'back in as done' \
+        -e 'putting' -e 'hosts finished:' -e 'covered' -e '^\[tx\] every' \
+        -e 'nothing available' -e 'PROGRESS'
+}
+
+t_a_short_lease_warns_once_and_changes_nothing() {
+    install_fake_ssh
+    install_fake_muster
+    # The same sweep twice, over two pools: once with no --lease, once
+    # with one far shorter than a wave (but long enough not to lapse
+    # under a job that only echoes).
+    muster add "a b c d e" --pool "$TEST_TMPDIR/plain.csv" > /dev/null
+    muster add "a b c d e" --pool "$TEST_TMPDIR/short.csv" > /dev/null
+    plan="$(sweep_plan a b c d e)"
+    run_tx run --plan "$plan" --muster "$TEST_TMPDIR/plain.csv" --batch 2 \
+        --start-in 1 --no-skew-check -d plain --quiet
+    local plain_rc="$RUN_RC" plain_out="$RUN_OUT"
+    run_tx run --plan "$plan" --muster "$TEST_TMPDIR/short.csv" --batch 2 \
+        --lease 45s --start-in 1 --no-skew-check -d short --quiet
+    # Warned once, over three waves, and before the first of them.
+    assert_eq "1" "$(printf '%s\n' "$RUN_OUT" | grep -c 'WARNING: --lease')" \
+        "a short lease should be warned about exactly once"
+    assert_eq "WARNING" "$(printf '%s\n' "$RUN_OUT" \
+        | grep -o -m1 -e 'WARNING' -e '=== wave 1')" \
+        "the warning should come before the first wave"
+    assert_contains "$RUN_OUT" "--lease 45s is shorter than one wave can take (1m31s)"
+    assert_contains "$RUN_OUT" "Give --lease 2m or more"
+    assert_contains "$RUN_OUT" "twice the wave and five minutes more (482s)"
+    assert_contains "$RUN_OUT" "in 3 waves"
+    # And nothing else differs: the exit status, the items done, what was
+    # collected, and the sweep's own account of it.
+    assert_status "$plain_rc" "$RUN_RC" "the warning changed the exit status"
+    assert_eq "$(muster status --pool "$TEST_TMPDIR/plain.csv" --csv | tail -1 | cut -d, -f2-)" \
+        "$(muster status --pool "$TEST_TMPDIR/short.csv" --csv | tail -1 | cut -d, -f2-)" \
+        "the warning changed what the pool records as done"
+    assert_eq "$(cd plain && find . -name 'pool~*' | sort)" \
+        "$(cd short && find . -name 'pool~*' | sort)" \
+        "the warning changed what was collected"
+    assert_eq "$(sweep_summary "$plain_out")" "$(sweep_summary "$RUN_OUT")" \
+        "the warning changed what the sweep did"
+    assert_contains "$(sweep_summary "$RUN_OUT")" "5 of 5 hosts finished: 5 passed"
+}
+
+t_a_long_enough_lease_or_none_does_not_warn() {
+    install_fake_ssh
+    install_fake_muster
+    plan="$(sweep_plan a b)"
+    # 2m covers 1m31s; 1h30m is muster's two-unit form, read the same way.
+    for lease in 2m 1h30m 91.04; do
+        muster add "a b" --pool "$TEST_TMPDIR/$lease.csv" > /dev/null
+        run_tx run --plan "$plan" --muster "$TEST_TMPDIR/$lease.csv" \
+            --batch 2 --lease "$lease" --start-in 1 --no-skew-check \
+            -d "r$lease" --quiet
+        assert_status 0 "$RUN_RC"
+        assert_not_contains "$RUN_OUT" "WARNING" "--lease $lease covers the wave"
+        assert_eq "pool.csv,2,2,0,0,100.00,0" \
+            "$(muster status --pool "$TEST_TMPDIR/$lease.csv" --csv | tail -1 \
+               | sed "s/^$lease.csv/pool.csv/")"
+    done
+    muster add "a b" --pool "$TEST_TMPDIR/none.csv" > /dev/null
+    run_tx run --plan "$plan" --muster "$TEST_TMPDIR/none.csv" --batch 2 \
+        --start-in 1 --no-skew-check -d none --quiet
+    assert_status 0 "$RUN_RC"
+    assert_not_contains "$RUN_OUT" "WARNING" "tx's own lease always covers the wave"
+}
+
+t_the_lease_reader_reads_what_muster_reads() {
+    # Each form muster's parse_duration accepts, and the ones it refuses
+    # (None), with what binnacle's muster (447f55f) makes of them. Where
+    # binnacle is installed, every one is also put to the real thing.
+    # Then the boundary: a lease exactly the length of the wave is enough,
+    # and a hair less is not.
+    out="$(python3 - "$(dirname "$TX")" <<'PY'
+import argparse, collections, sys
+sys.path.insert(0, sys.argv[1])
+import tx
+cases = [("90", 90), ("45m", 2700), ("2h", 7200), ("1h30m", 5400),
+         ("1.5h", 5400), ("1d", 86400), ("30s", 30), (" 2H ", 7200),
+         ("1h1h", 7200), (".5m", 30), ("5.", 5), ("1h30", 3630),
+         ("0", None), ("0s", None), ("", None), ("  ", None), ("h", None),
+         ("5x", None), ("1.2.3h", None), (".", None), ("-5", None),
+         ("1 h", None), ("1e3", None), ("inf", None), ("1hm", None),
+         ("m5", None)]
+bad = []
+for text, want in cases:
+    got = tx.lease_seconds(text)
+    if got != want:
+        bad.append("%r: tx reads %r, muster %r" % (text, got, want))
+try:
+    from binnacle import muster
+except ImportError:
+    muster = None
+if muster is not None:
+    import contextlib, io
+    for text, _want in cases:
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                real = muster.parse_duration(text)
+        except SystemExit:
+            real = None
+        if tx.lease_seconds(text) != real:
+            bad.append("%r: tx reads %r, binnacle's muster %r"
+                       % (text, tx.lease_seconds(text), real))
+Plan = collections.namedtuple("Plan", "setup teardown timeout")
+plan = Plan(setup="make", teardown="", timeout=30.0)
+args = argparse.Namespace(batch=2, start_in=1.0, lease="")
+wave = tx._muster_wave_bound(args, plan)
+for lease, warns in (("%rs" % wave, False), ("%rs" % (wave - 0.001), True),
+                     ("", False), ("5x", False), ("0", False)):
+    args.lease = lease
+    if bool(tx.muster_lease_warning(args, plan)) != warns:
+        bad.append("--lease %r against a %rs wave: warned %s"
+                   % (lease, wave, not warns))
+print("\n".join(bad) or "ok")
+PY
+)"
+    assert_eq "ok" "$out"
+}
+
+t_a_lease_tx_cannot_read_is_left_to_muster() {
+    # tx does not second-guess a lease it cannot read: no warning, and
+    # muster's own refusal is what stops the sweep, before anything runs.
+    install_fake_ssh
+    install_fake_muster
+    pool="$(make_pool a b)"
+    plan="$(sweep_plan a b)"
+    run_tx run --plan "$plan" --muster "$pool" --batch 2 --lease 5x \
+        --start-in 1 --no-skew-check -d results --quiet
+    assert_status 2 "$RUN_RC" "muster refusing the lease stops the sweep"
+    assert_not_contains "$RUN_OUT" "WARNING"
+    assert_contains "$RUN_OUT" "bad duration: 5x"
+    assert_eq "pool.csv,2,0,0,2,0.00,0" \
+        "$(muster status --pool "$pool" --csv | tail -1)"
+    assert_no_file "results/pool~a~out~who" "a ran under a lease muster refused"
+}
+
 # ---- the flag's own guardrails --------------------------------------------
 
 t_muster_needs_a_batch_size() {
@@ -554,6 +729,10 @@ run_test "a lapsed lease does not end it"      t_a_lapsed_lease_does_not_end_the
 run_test "a lapsed item is released once"      t_a_lapsed_item_is_released_once_under_its_own_lease
 run_test "a running item stays left"           t_an_item_still_running_stays_left_to_its_lease
 run_test "an item by name can start with -"    t_a_pool_item_taken_by_name_can_start_with_a_dash
+run_test "a short lease warns once"           t_a_short_lease_warns_once_and_changes_nothing
+run_test "a long enough lease does not warn"  t_a_long_enough_lease_or_none_does_not_warn
+run_test "the lease reads as muster reads it" t_the_lease_reader_reads_what_muster_reads
+run_test "an unreadable lease is muster's"    t_a_lease_tx_cannot_read_is_left_to_muster
 run_test "muster needs a batch size"           t_muster_needs_a_batch_size
 run_test "muster and resume are exclusive"     t_muster_and_resume_do_not_go_together
 run_test "a lease without a pool is refused"   t_a_lease_without_a_pool_is_refused

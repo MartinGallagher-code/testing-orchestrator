@@ -353,7 +353,8 @@ with a `/` (it cannot be part of a collected file's name). It is named and
 put back, and the sweep exits 1.
 
 `--lease` sets how long each wave holds its items; the default is twice
-the wave's own time bound, so a lease always outlasts the work it covers.
+the wave's own time bound and five minutes more, so a lease always
+outlasts the work it covers.
 That bound is the job's timeout plus the arming window, and the timeout
 again for `setup=` and again for `teardown=` when the plan has them: each
 phase is bounded by the timeout on its own, so a host can legitimately
@@ -382,6 +383,25 @@ reports it: muster's `CONFLICT` (somebody else holds it now, and their run
 is the duplicate) or `LATE` (nobody had taken it). The default lease is
 long enough that this needs a wave far past its own time bound; an
 explicit `--lease` shorter than a wave can take is what lets it happen.
+
+**So tx warns about one**, once, before the first take. One wave can take
+the time bound above plus the minute `tx run` waits past it; a `--lease`
+shorter than that gets a warning. For a job with a 15-minute timeout and a
+`setup=`, taken ten at a time:
+
+```text
+[tx] WARNING: --lease 20m is shorter than one wave can take (31m10s). If it lapses mid-wave, the pool can hand an item to another worker, who may deploy onto the same host while this sweep is still working there; muster reports that only at the check-in. Give --lease 32m or more (collecting and cleaning come on top of that), or leave --lease out and tx sets one twice the wave and five minutes more (4040s). Going ahead as asked.
+```
+
+It is a warning, not a refusal: the sweep goes ahead as asked, with the
+same exit status and the same results it would have had without it. The
+lease it suggests covers the wait and no more. Collecting and cleaning
+come after the wait and have no time limit of their own, so give them
+room on top, or leave `--lease` out. tx reads `--lease` as muster does:
+a bare number is seconds (`90`), and `45m`, `2h`, `1h30m` and `1.5h` count
+in units of s, m, h and d. A lease tx cannot read gets no warning from
+tx; muster refuses it at the first take (`bad duration`), and nothing is
+run.
 
 [b]: https://github.com/MartinGallagher-code/binnacle
 

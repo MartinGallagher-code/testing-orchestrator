@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "testing-orchestrator"
-version = "2.0.1"
+version = "2.0.2"
 description = "Run one benchmark or test on a whole fleet at once, and get the results back"
 readme = "README.md"
 requires-python = ">=3.6"

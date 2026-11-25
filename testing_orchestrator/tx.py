@@ -85,7 +85,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -3300,6 +3300,18 @@ def muster_addr(plan, item):
     return plan.addrs.get(item, item)
 
 
+def _muster_wave_bound(args, plan):
+    """The longest one --muster wave can take, in seconds.
+
+    The whole of the agent's own bound, setup and teardown included, and
+    the minute `_wait_deadline` waits on top of it: a host that overran a
+    job-only bound was still working when its item went back to the pool.
+    Collecting and cleaning come after the wait and have no limit of their
+    own, so they are not in it.
+    """
+    return _job_bound(plan, args.batch, args.start_in) + 60
+
+
 def muster_lease(args, plan):
     """How long to hold a wave's items for, if nobody said.
 
@@ -3314,15 +3326,105 @@ def muster_lease(args, plan):
     verb to renew one, and tx does not check it before collecting,
     cleaning or checking in (TX-009): a lease that lapses mid-wave is
     reported by muster at the check-in (CONFLICT, LATE), and the fix for
-    it is a longer lease.
+    it is a longer lease. So an explicit --lease is returned as given, and
+    one shorter than a wave can take is warned about once, before the
+    first take (`muster_lease_warning`, TX-011) -- warned, not refused:
+    the sweep runs just as it would have.
     """
     if args.lease:
         return args.lease
-    # The whole of the agent's own bound, setup and teardown included: a
-    # host that overran a job-only bound was still working when its item
-    # went back to the pool.
-    bound = _job_bound(plan, args.batch, args.start_in) + 60
-    return "%ds" % int(bound * 2 + 300)
+    return _default_lease(args, plan)
+
+
+def _default_lease(args, plan):
+    """The lease tx sets when --lease is left out: twice the wave, and
+    five minutes more."""
+    return "%ds" % int(_muster_wave_bound(args, plan) * 2 + 300)
+
+
+# muster's duration units, as binnacle's muster reads them.
+LEASE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def lease_seconds(text):
+    """A muster duration in seconds, or None where muster would refuse it.
+
+    tx passes --lease to muster as typed, and had no reason to read it
+    until it had to say whether a lease covers a wave (TX-011). It reads
+    it by the rules of binnacle's `parse_duration` (binnacle/muster.py):
+    a bare number is seconds, and a number followed by a unit counts in
+    that unit, as many times over as it is written -- '90', '45m', '2h',
+    '1h30m', '1.5h', '1d'. The units are s, m, h and d, in either case,
+    and spaces are allowed around the whole but not inside it.
+
+    Anything muster refuses -- an unknown unit, a unit with no number in
+    front of it, a number like '1.2.3' or '.', nothing at all, or a total
+    of zero -- is None here rather than a guess: muster's own refusal
+    ("bad duration") comes at the first take and stops the sweep, and that
+    is the one worth reading.
+    """
+    s = str(text).strip().lower()
+    total, num, seen = 0.0, "", False
+    try:
+        for ch in s:
+            if ch.isdigit() or ch == ".":
+                num += ch
+            elif ch in LEASE_UNITS and num:
+                total += float(num) * LEASE_UNITS[ch]
+                num, seen = "", True
+            else:
+                return None
+        if num:
+            total += float(num)
+            seen = True
+    except ValueError:
+        return None
+    if not seen or not total > 0:
+        return None
+    return total
+
+
+def _lease_text(seconds):
+    """Seconds as a lease muster reads, rounded up to the whole minute:
+    '45m', '2h', '1h05m'. Rounded up, so it is never shorter than what it
+    stands for."""
+    hours, minutes = divmod(int(-(-seconds // 60)), 60)
+    if not hours:
+        return "%dm" % minutes
+    if not minutes:
+        return "%dh" % hours
+    return "%dh%02dm" % (hours, minutes)
+
+
+def muster_lease_warning(args, plan):
+    """What to say about an explicit --lease shorter than one wave can
+    take, or None (TX-011).
+
+    A lease that lapses mid-wave lets the pool hand its item to another
+    worker, who can deploy onto the same host while tx is still waiting
+    on it, collecting from it or cleaning it, and muster says so only at
+    the check-in, afterwards (TX-009). Only an explicit --lease can be that
+    short: the default (`muster_lease`) is twice the wave and five minutes
+    more. A --lease tx cannot read gets nothing from tx: muster refuses it
+    at the first take.
+    """
+    if not args.lease:
+        return None
+    given = lease_seconds(args.lease)
+    if given is None:
+        return None
+    wave = _muster_wave_bound(args, plan)
+    if given >= wave:
+        return None
+    return ("[tx] WARNING: --lease %s is shorter than one wave can take "
+            "(%s). If it lapses mid-wave, the pool can hand an item to "
+            "another worker, who may deploy onto the same host while this "
+            "sweep is still working there; muster reports that only at the "
+            "check-in. Give --lease %s or more (collecting and cleaning come "
+            "on top of that), or leave --lease out and tx sets one twice the "
+            "wave and five minutes more (%s). Going ahead as asked."
+            % (args.lease, fmt_secs(wave), _lease_text(wave),
+               _default_lease(args, plan)))
 
 
 def _muster_interrupted(args, sub, wave, wave_states, collected):
@@ -3407,6 +3509,10 @@ def run_from_muster(args, plan):
     handback = os.path.join(tmp, "handback.txt")
     log("[tx] drawing from the pool %s, %d at a time, lease %s -> %s/"
         % (args.muster, args.batch, lease, args.dir))
+    # Once, before the first take, and only said: the sweep runs as asked.
+    short = muster_lease_warning(args, plan)
+    if short:
+        log(short)
     wave = 0
     stopped = False     # a Ctrl-C ended the sweep after this wave
     leased = []         # items left still running, to their lease
