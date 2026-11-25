@@ -67,6 +67,7 @@ Python 3.6+, standard library only, on the orchestrator and on every host.
 
 import argparse
 import base64
+import collections
 import configparser
 import errno
 import io
@@ -84,7 +85,7 @@ import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
@@ -3249,6 +3250,30 @@ def _check_in(args, path, verb, head, items):
     return rc
 
 
+def _fresh_in_pool(args, seen, count):
+    """Up to COUNT items the pool has available that this sweep has not seen.
+
+    In the pool's own order, so the sweep goes where `take` would have
+    sent it. Asked only when a take handed back nothing but items this
+    sweep had already seen: an item whose lease lapsed is available again,
+    and muster hands out what is available first in, so a take of one can
+    keep handing the same lapsed item back while the rest of the pool sits
+    behind it. Taking what is listed here by name steps past it, and an
+    empty answer is the pool really having nothing fresh -- which is what
+    ends the sweep, rather than a take that only looked empty.
+    """
+    import csv as _csv
+    _rc, out = _muster(args, "list", ["--state", "available"])
+    names = []
+    for row in _csv.DictReader(io.StringIO(out)):
+        name = (row.get("item") or "").strip()
+        if name and name not in seen and name not in names:
+            names.append(name)
+            if len(names) >= count:
+                break
+    return names
+
+
 def _plan_over(plan, items, addrs):
     """The same job, over hosts the plan need not have named.
 
@@ -3284,6 +3309,12 @@ def muster_lease(args, plan):
     to prevent. muster's own default is an hour, and a job with a
     two-hour timeout would quietly outlive it, so the default here is the
     wave's own bound with room on top rather than a number picked flat.
+
+    The lease is fixed when the items are taken. binnacle's muster has no
+    verb to renew one, and tx does not check it before collecting,
+    cleaning or checking in (TX-009): a lease that lapses mid-wave is
+    reported by muster at the check-in (CONFLICT, LATE), and the fix for
+    it is a longer lease.
     """
     if args.lease:
         return args.lease
@@ -3334,7 +3365,8 @@ def run_from_muster(args, plan):
 
     One loop: take X, run them as a wave, and give them back -- items
     that ran are done, items nothing ran on are released for somebody
-    else. It ends when the pool has nothing left to hand out.
+    else. It ends when the pool has nothing left to hand out that this
+    sweep has not already seen.
 
     "Nothing left to hand out" is deliberately not "the pool is
     complete". Other workers may be holding the rest, and a sweep that
@@ -3353,7 +3385,17 @@ def run_from_muster(args, plan):
     # available again at once, and the very next take would hand the
     # same unreachable host straight back -- a sweep that never ends,
     # spinning on the one rack that is down.
-    holding = []
+    #
+    # Kept as item -> the header of the ticket it is held under *now*.
+    # An item whose lease lapsed and that a later take handed back is
+    # held under that take's lease, not the first one: releasing it under
+    # both counted one item twice, and the release under the old lease
+    # drew a CONFLICT naming tx's own new lease (TX-009).
+    holding = collections.OrderedDict()
+
+    def hold(head, items):
+        for item in items:
+            holding[item] = head
     # Chosen once, before the first wave: the default is stamped with
     # the time, and a fresh directory per wave would scatter one sweep
     # across ten of them.
@@ -3368,23 +3410,38 @@ def run_from_muster(args, plan):
     wave = 0
     stopped = False     # a Ctrl-C ended the sweep after this wave
     leased = []         # items left still running, to their lease
+    by_name = []        # the next take's items, named (see _fresh_in_pool)
     try:
         while True:
+            # By name as --item=NAME, never --item NAME: a pool item can
+            # start with '-' (it is refused below, not run), and muster
+            # would read a separate '-oProxyCommand=...' as an option.
+            want = (["--item=%s" % i for i in by_name] if by_name
+                    else [str(args.batch)])
+            asked_by_name, by_name = bool(by_name), []
             _rc, _out = _muster(args, "take",
-                                [str(args.batch), "-o", ticket,
-                                 "--lease", lease])
+                                want + ["-o", ticket, "--lease", lease])
             head, items = _ticket_parts(ticket)
-            # An item we have already run coming back means its lease
+            # An item we have already seen coming back means its lease
             # lapsed mid-sweep and the pool offered it to us again.
             # Running it twice is exactly what the pool is for
             # preventing, so it is held rather than re-run, and goes
-            # back with the rest at the end.
+            # back with the rest at the end -- once, under this lease.
             again = [i for i in items if i in seen]
             fresh = [i for i in items if i not in seen]
             if again:
                 log("[tx] %d item(s) came back with a lapsed lease; holding "
                     "them rather than running them a second time" % len(again))
-                holding.append((head, again))
+                for item in again:
+                    if item in leased:
+                        # Still running when its wave stopped waiting, so
+                        # left to its lease. It is held again now, under
+                        # this one, and left to it the same way: putting
+                        # it back at the end would hand a host that may
+                        # still be running to the next worker.
+                        holding.pop(item, None)
+                    else:
+                        hold(head, [item])
             # An item the pool hands out is not necessarily something ssh
             # can be pointed at: '-oProxyCommand=...' as a destination is
             # an option, and a '/' crashed the collection with the item
@@ -3395,14 +3452,27 @@ def run_from_muster(args, plan):
                 for item in unusable:
                     log("[tx] not running pool item %r: it %s"
                         % (item, host_problem(item, muster_addr(plan, item))))
-                holding.append((head, unusable))
+                hold(head, unusable)
                 seen.update(unusable)
                 trouble.append(0)
                 fresh = [i for i in fresh if i not in set(unusable)]
                 if not fresh:
                     continue
             if not fresh:
-                if not items:
+                if items or asked_by_name:
+                    # Everything this take handed out had come back with a
+                    # lapsed lease (or a take by name found its items gone
+                    # to another worker). That is not an empty pool: ask
+                    # it what it has that this sweep has not seen, and
+                    # take those by name. Each round either runs a wave
+                    # or finds nothing fresh, so it cannot spin on an
+                    # item that keeps lapsing.
+                    by_name = _fresh_in_pool(args, seen, args.batch)
+                    if by_name:
+                        continue
+                    log("[tx] the pool has nothing available that this "
+                        "sweep has not already been handed.")
+                else:
                     log("[tx] the pool has nothing available.")
                 break
 
@@ -3428,8 +3498,7 @@ def run_from_muster(args, plan):
                 trouble.append(wave)
                 for item in fresh:
                     states[item] = (False, None, "WAVE DID NOT START")
-                holding.append((head, [i for i in fresh
-                                       if i not in exc.left]))
+                hold(head, [i for i in fresh if i not in exc.left])
                 leased.extend(exc.left)
                 break
             if started:
@@ -3440,7 +3509,7 @@ def run_from_muster(args, plan):
                 trouble.append(wave)
                 for item in fresh:
                     states[item] = (False, None, "WAVE DID NOT START")
-                holding.append((head, fresh))
+                hold(head, fresh)
                 if args.stop_on_fail:
                     log("[tx] --stop-on-fail: not taking any more from the "
                         "pool")
@@ -3517,7 +3586,7 @@ def run_from_muster(args, plan):
                     "rather than handing them out again" % len(working))
                 leased.extend(working)
             if idle:
-                holding.append((head, idle))
+                hold(head, idle)
             if stopped:
                 break
             if args.stop_on_fail and (unclean or not finished):
@@ -3525,14 +3594,17 @@ def run_from_muster(args, plan):
                 break
 
         # Everything that was leased and never measured, put back in one
-        # go now that no further take can pick it up again.
-        stranded = sum(len(items) for _h, items in holding)
-        if stranded:
+        # go now that no further take can pick it up again: each item
+        # once, under the lease it is held by now.
+        if holding:
             log("")
             log("[tx] putting %d item(s) back: nothing ran on them"
-                % stranded)
-            for head, items in holding:
-                if _check_in(args, handback, "release", head, items):
+                % len(holding))
+            by_lease = collections.OrderedDict()
+            for item, head in holding.items():
+                by_lease.setdefault(tuple(head), []).append(item)
+            for head, items in by_lease.items():
+                if _check_in(args, handback, "release", list(head), items):
                     trouble.append(0)
     except KeyboardInterrupt:
         # Ctrl-C while tx talks to the pool, or a second one while a wave's
