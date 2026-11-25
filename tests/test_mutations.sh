@@ -529,6 +529,13 @@ m_a_refused_take_is_an_unreadable_pool() {
     caught test_muster.sh "a lease muster refuses is named"
 }
 
+m_a_lease_read_as_an_option() {
+    # `--lease VALUE` as two arguments: muster read `-5m` as an option and
+    # never got as far as saying what was wrong with it.
+    mutant '"--lease=%s" % lease])' '"--lease", lease])' || return 1
+    caught test_muster.sh "a lease muster refuses is named"
+}
+
 m_a_function_defined_twice() {
     mutant 'def _median(values):' 'def _median(values):
     return None
@@ -587,5 +594,6 @@ run_test "a job's file as a host is caught"    m_an_unreadable_jobs_file_is_a_ho
 run_test "a broken pipe traceback is caught"   m_a_broken_pipe_is_a_traceback
 run_test "a silent cut-off is caught"          m_a_broken_pipe_partway_is_silent
 run_test "a take refused as unreadable caught" m_a_refused_take_is_an_unreadable_pool
+run_test "a lease read as an option is caught" m_a_lease_read_as_an_option
 run_test "a function defined twice is caught"  m_a_function_defined_twice
 report_tests

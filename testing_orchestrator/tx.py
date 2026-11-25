@@ -3440,8 +3440,11 @@ def run_from_muster(args, plan):
             want = (["--item=%s" % i for i in by_name] if by_name
                     else [str(args.batch)])
             asked_by_name, by_name = bool(by_name), []
+            # --lease=VALUE for the same reason: as `--lease -5m`, muster
+            # read the value as an option and said only that --lease
+            # wanted one, where `--lease=-5m` gets "bad duration" (TX-010).
             _rc, _out = _muster(args, "take",
-                                want + ["-o", ticket, "--lease", lease])
+                                want + ["-o", ticket, "--lease=%s" % lease])
             head, items = _ticket_parts(ticket)
             # An item we have already seen coming back means its lease
             # lapsed mid-sweep and the pool offered it to us again.

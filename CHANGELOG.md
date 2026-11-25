@@ -49,7 +49,10 @@ format are unchanged.
   (`--lease=-5m`) made tx say "the pool could not be read or written".
   muster had refused the argument. tx now says `muster refused the take
   (exit 2; what it said is above)`, and what that left undone, after
-  muster's own message.
+  muster's own message. tx also passes the lease as `--lease=VALUE`, as it
+  already passed items as `--item=NAME`: given `--lease -5m` as two
+  arguments, muster read `-5m` as an option and said only that `--lease`
+  wanted a value, never what was wrong with it.
 - **`_median` is defined once.** `tx.py` defined it twice, identically, and
   the second shadowed the first. A test now fails on any top-level
   function or class defined twice.
